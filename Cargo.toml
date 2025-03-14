@@ -1,0 +1,26 @@
+[package]
+name = "fast-registry-json"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrayref = "0.3.9"
+rustc-hash = "2.1.1"
+
+[features]
+default = ["simd"]
+simd = []
+
+[dev-dependencies]
+deno_npm = "0.27.2"
+divan = "0.1.17"
+serde = "1.0.219"
+serde_json = "1.0.140"
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
