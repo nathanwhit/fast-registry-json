@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use simd::{Simd8, Simd8x64, make_uint8x16_t};
 
 pub mod simd;
@@ -515,7 +517,9 @@ impl<'a> BitIndexer<'a> {
             return;
         }
         let lz = rev_bits.leading_zeros();
-        self.tail[self.idx + i] = index + lz;
+        unsafe {
+            *self.tail.get_unchecked_mut(self.idx + i) = index + lz;
+        }
         *rev_bits = zero_leading_bit(*rev_bits, lz);
     }
 
@@ -563,7 +567,7 @@ impl<'a> BitIndexer<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token {
     pub start: u32,
     pub end: u32,
@@ -576,7 +580,7 @@ impl Token {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     Operator,
     String,
@@ -589,6 +593,10 @@ pub struct Tokenizer<'a> {
 
     block_reader: BufBlockReader<'a, 64>,
     idx: u32,
+
+    incomplete_string: bool,
+
+    input: &'a [u8],
 }
 
 impl<'a> Tokenizer<'a> {
@@ -599,24 +607,49 @@ impl<'a> Tokenizer<'a> {
             buf: vec![0; 64 * 3],
             block_reader: BufBlockReader::new(input),
             idx: 0,
+            incomplete_string: false,
+            input,
         }
     }
 
-    fn process_json_block(&mut self, json_block: JsonBlock) {
+    fn process_json_block(&mut self, json_block: JsonBlock, block: &simd::Simd8x64<u8>) {
         let mut bit_indexer = BitIndexer::new(&mut self.buf);
 
         let ops = json_block.characters.op() & !json_block.string.in_string;
-        let strings = json_block.string.in_string;
+        let mut strings = json_block.string.in_string & !json_block.string.quote;
 
         let wrote_ops = bit_indexer.write(self.idx, ops);
         let mut bit_indexer = BitIndexer::new(&mut self.buf[wrote_ops..]);
-        let wrote_strings = bit_indexer.write(self.idx, strings);
-        let mut bit_indexer = BitIndexer::new(&mut self.buf[wrote_ops + wrote_strings..]);
-        let wrote_scalars = bit_indexer.write(
-            self.idx,
-            json_block.potential_scalar_start() & !strings & !json_block.string.quote,
-        );
 
+        if self.incomplete_string {
+            let pos = 64 - json_block.string.quote.trailing_zeros();
+            if pos == 0 {
+                return;
+            }
+            // let pos = pos - 1;
+            let last = self.tokens.len() - 1;
+            self.tokens[last].end = self.idx + (64 - pos);
+            // eprintln!(
+            //     "{}",
+            //     self.tokens[last].value(unsafe { std::str::from_utf8_unchecked(self.input) })
+            // );
+            // eprintln!("pos: {}", pos);
+            let mask = if pos <= 1 {
+                0
+            } else {
+                (!0u64) << ((64 - pos) + 1)
+            };
+            self.incomplete_string = false;
+            strings = strings & mask;
+        }
+        let wrote_strings = bit_indexer.write(self.idx, strings);
+        // let mut bit_indexer = BitIndexer::new(&mut self.buf[wrote_ops + wrote_strings..]);
+        // let wrote_scalars = bit_indexer.write(
+        //     self.idx,
+        //     json_block.potential_scalar_start() & !strings & !json_block.string.quote,
+        // );
+
+        let num_tokens = self.tokens.len();
         for i in 0..wrote_ops {
             let start = self.buf[i as usize];
             let end = start + 1;
@@ -628,6 +661,7 @@ impl<'a> Tokenizer<'a> {
         }
 
         let mut i = wrote_ops;
+        let mut last_end = 0;
         while i < wrote_ops + wrote_strings {
             let start = self.buf[i as usize];
             // find the end of the string
@@ -637,23 +671,36 @@ impl<'a> Tokenizer<'a> {
                 end = self.buf[i as usize];
                 i += 1;
             }
-
+            last_end = end;
             self.tokens.push(Token {
-                start: start + 1,
+                start,
                 end: end + 1,
                 kind: TokenKind::String,
             });
         }
 
-        for i in wrote_ops + wrote_strings..wrote_ops + wrote_strings + wrote_scalars {
-            let start = self.buf[i as usize];
-            let end = start + 1;
-            self.tokens.push(Token {
-                start,
-                end,
-                kind: TokenKind::Scalar,
-            });
+        self.tokens[num_tokens..].sort_unstable_by_key(|t| t.start);
+
+        if wrote_strings > 0 {
+            let last_mask = 0x8000000000000000;
+
+            if last_end - self.idx == 63
+                && (last_mask & strings | json_block.string.quote) != 0
+                && (last_mask & json_block.string.quote) == 0
+            {
+                self.incomplete_string = true;
+            }
         }
+
+        // for i in wrote_ops + wrote_strings..wrote_ops + wrote_strings + wrote_scalars {
+        //     let start = self.buf[i as usize];
+        //     let end = start + 1;
+        //     self.tokens.push(Token {
+        //         start,
+        //         end,
+        //         kind: TokenKind::Scalar,
+        //     });
+        // }
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Token>, Error> {
@@ -662,7 +709,7 @@ impl<'a> Tokenizer<'a> {
             let block = simd::Simd8x64::<u8>::load(arrayref::array_ref![block, 0, 64]);
             let json_block = self.scanner.next(&block);
             self.block_reader.advance();
-            self.process_json_block(json_block);
+            self.process_json_block(json_block, &block);
             self.idx += 64;
         }
 
@@ -671,48 +718,10 @@ impl<'a> Tokenizer<'a> {
         let block = simd::Simd8x64::<u8>::load(arrayref::array_ref![&remainder_buf, 0, 64]);
         let json_block = self.scanner.next(&block);
         self.block_reader.advance();
-        self.process_json_block(json_block);
+        self.process_json_block(json_block, &block);
         self.idx += 64;
         self.scanner.finish()?;
-        self.tokens.sort_by_key(|t| t.start);
-        let mut i = 0;
-        let mut remove = rustc_hash::FxHashSet::default();
-        while i < self.tokens.len() {
-            let mut tok = self.tokens[i];
-            match tok.kind {
-                TokenKind::Scalar => {
-                    let mut j = i + 1;
-                    while j < self.tokens.len()
-                        && !matches!(self.tokens[j].kind, TokenKind::Operator)
-                    {
-                        j += 1;
-                    }
-                    tok.end = self.tokens[j].start;
-                    self.tokens[i] = tok;
-                }
-                TokenKind::String => {
-                    let mut j = i + 1;
-                    while j < self.tokens.len() && matches!(self.tokens[j].kind, TokenKind::String)
-                    {
-                        j += 1;
-                    }
-                    if j != i + 1 {
-                        tok.end = self.tokens[j - 1].end;
-                        self.tokens[i] = tok;
-                        remove.insert(j - 1);
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        let mut new_tokens = Vec::new();
-        for (i, tok) in self.tokens.iter().enumerate() {
-            if !remove.contains(&i) {
-                new_tokens.push(*tok);
-            }
-        }
-        Ok(new_tokens)
+        Ok(self.tokens)
     }
 }
 
@@ -724,6 +733,7 @@ pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Vec<&
     let mut state = State::Start;
     let mut versions = Vec::new();
     let mut object_depth = 0;
+    let input_bytes = input.as_bytes();
     for token in tokens {
         match token.kind {
             TokenKind::String => {
@@ -734,9 +744,10 @@ pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Vec<&
                 }
             }
             TokenKind::Operator => {
-                if token.value(input) == "{" {
+                let v = input_bytes[token.start as usize];
+                if v == b'{' {
                     object_depth += 1;
-                } else if token.value(input) == "}" {
+                } else if v == b'}' {
                     if object_depth == 2 && matches!(state, State::InVersions) {
                         state = State::Start;
                     }
@@ -759,6 +770,7 @@ pub fn pluck_versions(input: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
+    use pretty_assertions::assert_eq;
     #[test]
     fn zero_leading_bit_works() {
         let cases: &[(u64, u64)] = &[(0b0100, 0), (0b0101, 0b0001)];
@@ -768,5 +780,127 @@ mod tests {
             let result = zero_leading_bit(rev_bits, leading_zeroes);
             assert_eq!(result, expected);
         }
+    }
+
+    fn string(start: u32, s: &str) -> Token {
+        Token {
+            start,
+            end: start + s.len() as u32,
+            kind: TokenKind::String,
+        }
+    }
+
+    fn op(start: u32) -> Token {
+        Token {
+            start,
+            end: start + 1,
+            kind: TokenKind::Operator,
+        }
+    }
+
+    struct TokensBuilder {
+        tokens: Vec<Token>,
+    }
+
+    impl TokensBuilder {
+        fn new() -> Self {
+            Self { tokens: Vec::new() }
+        }
+
+        fn then(self, offset: u32, f: impl FnOnce(Self, u32) -> Self) -> Self {
+            let last_end = self.tokens.last().map_or(0, |t| t.end);
+            let s = f(self, last_end + offset);
+            s
+        }
+
+        fn string(mut self, start: u32, s: &str) -> Self {
+            self.tokens.push(string(start, s));
+            self
+        }
+
+        fn op(mut self, start: u32) -> Self {
+            self.tokens.push(op(start));
+            self
+        }
+
+        fn then_string(self, offset: u32, s: &str) -> Self {
+            self.then(offset, |b, i| b.string(i, s))
+        }
+
+        fn then_op(self, offset: u32) -> Self {
+            self.then(offset, |b, i| b.op(i))
+        }
+
+        fn build(self) -> Vec<Token> {
+            self.tokens
+        }
+    }
+
+    fn annotated(input: &str, toks: &[Token]) -> String {
+        let mut annotated = String::new();
+        for tok in toks {
+            annotated.push_str(&format!("{} {} {:?}\n", tok.start, tok.end, tok.kind));
+            annotated.push('"');
+            if tok.start <= tok.end {
+                annotated.push_str(&input[tok.start as usize..tok.end as usize]);
+            } else {
+                annotated.push_str("badbadbad");
+            }
+            annotated.push('"');
+            annotated.push('\n');
+        }
+        annotated
+    }
+
+    fn assert_tokens_eq(input: &str, expected: Vec<Token>) {
+        let tokens = Tokenizer::new(input.as_bytes()).tokenize().unwrap();
+        if tokens != expected {
+            eprintln!("got\n-----\n{}", annotated(input, &tokens));
+            eprintln!("expected\n-----\n{}", annotated(input, &expected));
+        }
+        assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn incomplete_string_works() {
+        let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkabcd":"asdf"}}"#;
+
+        let expected = TokensBuilder::new()
+            .then_op(0)
+            .then_string(1, "versions")
+            .then_op(1)
+            .then_op(0)
+            .then_string(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .then_op(1) // :
+            .then_op(0) // {
+            .then_op(0) // }
+            .then_op(0) // ,
+            .then_string(1, "bcdefghijkabcd")
+            .then_op(1) // :
+            .then_string(1, "asdf")
+            .then_op(1) // }
+            .then_op(0) // }
+            .build();
+        assert_tokens_eq(input, expected);
+
+        eprintln!("one ok");
+        let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkab":"asdf"}}"#;
+        let expected = TokensBuilder::new()
+            .then_op(0)
+            .then_string(1, "versions")
+            .then_op(1) // :
+            .then_op(0) // {
+            .then_string(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .then_op(1) // :
+            .then_op(0) // {
+            .then_op(0) // }
+            .then_op(0) // ,
+            .then_string(1, "bcdefghijkab")
+            .then_op(1) // :
+            .then_string(1, "asdf")
+            .then_op(1) // }
+            .then_op(0) // }
+            .build();
+        assert_tokens_eq(input, expected);
     }
 }
