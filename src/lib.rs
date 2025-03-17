@@ -523,11 +523,11 @@ impl<'a> BitIndexer<'a> {
         *rev_bits = zero_leading_bit(*rev_bits, lz);
     }
 
-    pub fn write_indexes(&mut self, index: u32, rev_bits: &mut u64, start: usize, n: usize) {
+    pub fn write_indexes(&mut self, index: u32, rev_bits: &mut u64, start: usize) {
         self.write_index(index, rev_bits, start);
-        if n > 1 {
-            self.write_indexes(index, rev_bits, start + 1, n - 1);
-        }
+        self.write_index(index, rev_bits, start + 1);
+        self.write_index(index, rev_bits, start + 2);
+        self.write_index(index, rev_bits, start + 3);
     }
 
     pub fn write_indexes_stepped(
@@ -537,12 +537,11 @@ impl<'a> BitIndexer<'a> {
         cnt: usize,
         start: usize,
         end: usize,
-        step: usize,
     ) {
-        self.write_indexes(index, rev_bits, start, step);
-        if start + step < end {
-            if start + step < cnt {
-                self.write_indexes_stepped(index, rev_bits, cnt, start + step, end, step);
+        self.write_indexes(index, rev_bits, start);
+        if start + 4 < end {
+            if start + 4 < cnt {
+                self.write_indexes_stepped(index, rev_bits, cnt, start + 4, end);
             }
         }
     }
@@ -554,7 +553,8 @@ impl<'a> BitIndexer<'a> {
 
         let cnt = bits.count_ones();
         let mut rev_bits = bits.reverse_bits();
-        self.write_indexes_stepped(index, &mut rev_bits, cnt as usize, 0, 24, 4);
+
+        self.write_indexes_stepped(index, &mut rev_bits, cnt as usize, 0, 24);
 
         if 24 < cnt {
             for i in 24..cnt {
@@ -591,6 +591,8 @@ pub struct Tokenizer<'a> {
     tokens: Vec<Token>,
     buf: Vec<u32>,
 
+    num_tokens: usize,
+
     block_reader: BufBlockReader<'a, 64>,
     idx: u32,
 
@@ -603,12 +605,13 @@ impl<'a> Tokenizer<'a> {
     pub fn new(input: &'a [u8]) -> Self {
         Self {
             scanner: JsonScanner::new(),
-            tokens: Vec::new(),
+            tokens: Vec::with_capacity(input.len() / 3),
             buf: vec![0; 64 * 3],
             block_reader: BufBlockReader::new(input),
             idx: 0,
             incomplete_string: false,
             input,
+            num_tokens: 0,
         }
     }
 
