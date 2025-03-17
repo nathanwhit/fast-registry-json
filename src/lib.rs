@@ -569,14 +569,39 @@ impl<'a> BitIndexer<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token {
-    pub start: u32,
-    pub end: u32,
-    pub kind: TokenKind,
+    data: u64,
 }
 
 impl Token {
-    pub fn value<'a>(&self, input: &'a str) -> &'a str {
-        &input[self.start as usize..self.end as usize]
+    pub fn new(start: u32, end: u32, kind: TokenKind) -> Self {
+        Self {
+            data: (start as u64)
+                | ((end as u64 & 0x7FFFFFFFFFFFFFFF) << 32)
+                | ((kind as u64) << 63),
+        }
+    }
+
+    pub fn start(&self) -> u32 {
+        (self.data & 0xFFFFFFFF) as u32
+    }
+    pub fn end(&self) -> u32 {
+        ((self.data & 0x7FFFFFFFFFFFFFFF) >> 32) as u32
+    }
+
+    pub fn set_end(&mut self, end: u32) {
+        self.data = (self.data & 0x80000000_FFFFFFFF) | ((end as u64) & 0x7FFFFFFFFFFFFFFF) << 32;
+    }
+
+    pub fn kind(&self) -> TokenKind {
+        match self.data >> 63 {
+            0 => TokenKind::Operator,
+            1 => TokenKind::String,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+
+    pub fn value<'a>(&self, input: &'a [u8]) -> &'a [u8] {
+        &input[self.start() as usize..self.end() as usize]
     }
 }
 
@@ -584,7 +609,7 @@ impl Token {
 pub enum TokenKind {
     Operator,
     String,
-    Scalar,
+    // Scalar,
 }
 pub struct Tokenizer<'a> {
     scanner: JsonScanner,
@@ -603,6 +628,9 @@ pub struct Tokenizer<'a> {
 
 impl<'a> Tokenizer<'a> {
     pub fn new(input: &'a [u8]) -> Self {
+        if input.len() > 0x7FFF_FFFF {
+            panic!("input is too long");
+        }
         Self {
             scanner: JsonScanner::new(),
             tokens: Vec::with_capacity(input.len() / 3),
@@ -631,7 +659,7 @@ impl<'a> Tokenizer<'a> {
             }
             // let pos = pos - 1;
             let last = self.tokens.len() - 1;
-            self.tokens[last].end = self.idx + (64 - pos);
+            self.tokens[last].set_end(self.idx + (64 - pos));
             // eprintln!(
             //     "{}",
             //     self.tokens[last].value(unsafe { std::str::from_utf8_unchecked(self.input) })
@@ -656,11 +684,8 @@ impl<'a> Tokenizer<'a> {
         for i in 0..wrote_ops {
             let start = self.buf[i as usize];
             let end = start + 1;
-            self.tokens.push(Token {
-                start,
-                end,
-                kind: TokenKind::Operator,
-            });
+            self.tokens
+                .push(Token::new(start, end, TokenKind::Operator));
         }
 
         let mut i = wrote_ops;
@@ -675,14 +700,11 @@ impl<'a> Tokenizer<'a> {
                 i += 1;
             }
             last_end = end;
-            self.tokens.push(Token {
-                start,
-                end: end + 1,
-                kind: TokenKind::String,
-            });
+            self.tokens
+                .push(Token::new(start, end + 1, TokenKind::String));
         }
 
-        self.tokens[num_tokens..].sort_unstable_by_key(|t| t.start);
+        self.tokens[num_tokens..].sort_unstable_by_key(|t| t.start());
 
         if wrote_strings > 0 {
             let last_mask = 0x8000000000000000;
@@ -738,16 +760,17 @@ pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Vec<&
     let mut object_depth = 0;
     let input_bytes = input.as_bytes();
     for token in tokens {
-        match token.kind {
+        match token.kind() {
             TokenKind::String => {
-                if object_depth == 1 && token.value(input) == "versions" {
+                if object_depth == 1 && token.value(input_bytes) == b"versions" {
                     state = State::InVersions;
                 } else if object_depth == 2 && matches!(state, State::InVersions) {
-                    versions.push(token.value(input));
+                    versions
+                        .push(unsafe { std::str::from_utf8_unchecked(token.value(input_bytes)) });
                 }
             }
             TokenKind::Operator => {
-                let v = input_bytes[token.start as usize];
+                let v = input_bytes[token.start() as usize];
                 if v == b'{' {
                     object_depth += 1;
                 } else if v == b'}' {
@@ -757,7 +780,6 @@ pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Vec<&
                     object_depth -= 1;
                 }
             }
-            _ => {}
         }
     }
     versions
@@ -786,19 +808,11 @@ mod tests {
     }
 
     fn string(start: u32, s: &str) -> Token {
-        Token {
-            start,
-            end: start + s.len() as u32,
-            kind: TokenKind::String,
-        }
+        Token::new(start, start + s.len() as u32, TokenKind::String)
     }
 
     fn op(start: u32) -> Token {
-        Token {
-            start,
-            end: start + 1,
-            kind: TokenKind::Operator,
-        }
+        Token::new(start, start + 1, TokenKind::Operator)
     }
 
     struct TokensBuilder {
@@ -811,7 +825,7 @@ mod tests {
         }
 
         fn then(self, offset: u32, f: impl FnOnce(Self, u32) -> Self) -> Self {
-            let last_end = self.tokens.last().map_or(0, |t| t.end);
+            let last_end = self.tokens.last().map_or(0, |t| t.end());
             let s = f(self, last_end + offset);
             s
         }
@@ -842,10 +856,10 @@ mod tests {
     fn annotated(input: &str, toks: &[Token]) -> String {
         let mut annotated = String::new();
         for tok in toks {
-            annotated.push_str(&format!("{} {} {:?}\n", tok.start, tok.end, tok.kind));
+            annotated.push_str(&format!("{} {} {:?}\n", tok.start(), tok.end(), tok.kind()));
             annotated.push('"');
-            if tok.start <= tok.end {
-                annotated.push_str(&input[tok.start as usize..tok.end as usize]);
+            if tok.start() <= tok.end() {
+                annotated.push_str(&input[tok.start() as usize..tok.end() as usize]);
             } else {
                 annotated.push_str("badbadbad");
             }
