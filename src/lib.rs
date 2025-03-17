@@ -750,13 +750,19 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Vec<&'i str> {
+pub fn pluck_versions_from_tokens<'i>(
+    input: &'i str,
+    tokens: &[Token],
+) -> (Vec<&'i str>, Vec<(u32, u32)>) {
     enum State {
         Start,
         InVersions,
+        WantVersion,
     }
     let mut state = State::Start;
     let mut versions = Vec::new();
+
+    let mut version_ranges = Vec::new();
     let mut object_depth = 0;
     let input_bytes = input.as_bytes();
     for token in tokens {
@@ -767,25 +773,37 @@ pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Vec<&
                 } else if object_depth == 2 && matches!(state, State::InVersions) {
                     versions
                         .push(unsafe { std::str::from_utf8_unchecked(token.value(input_bytes)) });
+                    state = State::WantVersion;
                 }
             }
             TokenKind::Operator => {
                 let v = input_bytes[token.start() as usize];
                 if v == b'{' {
                     object_depth += 1;
+                    if object_depth == 3 && matches!(state, State::WantVersion) {
+                        version_ranges.push((token.start(), token.end()));
+                    }
                 } else if v == b'}' {
                     if object_depth == 2 && matches!(state, State::InVersions) {
                         state = State::Start;
+                    } else if object_depth == 3 && matches!(state, State::WantVersion) {
+                        let last = version_ranges.len() - 1;
+                        version_ranges[last].1 = token.end();
+                        state = State::InVersions;
                     }
+                    object_depth -= 1;
+                } else if v == b'[' {
+                    object_depth += 1;
+                } else if v == b']' {
                     object_depth -= 1;
                 }
             }
         }
     }
-    versions
+    (versions, version_ranges)
 }
 
-pub fn pluck_versions(input: &str) -> Vec<&str> {
+pub fn pluck_versions(input: &str) -> (Vec<&str>, Vec<(u32, u32)>) {
     let tokenizer = Tokenizer::new(input.as_bytes());
     let tokens = tokenizer.tokenize().unwrap();
     pluck_versions_from_tokens(input, &tokens)
@@ -830,22 +848,22 @@ mod tests {
             s
         }
 
-        fn string(mut self, start: u32, s: &str) -> Self {
+        fn with_string(mut self, start: u32, s: &str) -> Self {
             self.tokens.push(string(start, s));
             self
         }
 
-        fn op(mut self, start: u32) -> Self {
+        fn with_op(mut self, start: u32) -> Self {
             self.tokens.push(op(start));
             self
         }
 
-        fn then_string(self, offset: u32, s: &str) -> Self {
-            self.then(offset, |b, i| b.string(i, s))
+        fn string(self, offset: u32, s: &str) -> Self {
+            self.then(offset, |b, i| b.with_string(i, s))
         }
 
-        fn then_op(self, offset: u32) -> Self {
-            self.then(offset, |b, i| b.op(i))
+        fn op(self, offset: u32) -> Self {
+            self.then(offset, |b, i| b.with_op(i))
         }
 
         fn build(self) -> Vec<Token> {
@@ -883,41 +901,75 @@ mod tests {
         let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkabcd":"asdf"}}"#;
 
         let expected = TokensBuilder::new()
-            .then_op(0)
-            .then_string(1, "versions")
-            .then_op(1)
-            .then_op(0)
-            .then_string(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .then_op(1) // :
-            .then_op(0) // {
-            .then_op(0) // }
-            .then_op(0) // ,
-            .then_string(1, "bcdefghijkabcd")
-            .then_op(1) // :
-            .then_string(1, "asdf")
-            .then_op(1) // }
-            .then_op(0) // }
+            .op(0)
+            .string(1, "versions")
+            .op(1)
+            .op(0)
+            .string(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .op(1) // :
+            .op(0) // {
+            .op(0) // }
+            .op(0) // ,
+            .string(1, "bcdefghijkabcd")
+            .op(1) // :
+            .string(1, "asdf")
+            .op(1) // }
+            .op(0) // }
             .build();
         assert_tokens_eq(input, expected);
 
         eprintln!("one ok");
         let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkab":"asdf"}}"#;
         let expected = TokensBuilder::new()
-            .then_op(0)
-            .then_string(1, "versions")
-            .then_op(1) // :
-            .then_op(0) // {
-            .then_string(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .then_op(1) // :
-            .then_op(0) // {
-            .then_op(0) // }
-            .then_op(0) // ,
-            .then_string(1, "bcdefghijkab")
-            .then_op(1) // :
-            .then_string(1, "asdf")
-            .then_op(1) // }
-            .then_op(0) // }
+            .op(0)
+            .string(1, "versions")
+            .op(1) // :
+            .op(0) // {
+            .string(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .op(1) // :
+            .op(0) // {
+            .op(0) // }
+            .op(0) // ,
+            .string(1, "bcdefghijkab")
+            .op(1) // :
+            .string(1, "asdf")
+            .op(1) // }
+            .op(0) // }
             .build();
         assert_tokens_eq(input, expected);
+    }
+
+    #[test]
+    fn split_utf8_works() {
+        let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkabc♥♥":{}}}"#;
+        let builder = TokensBuilder::new();
+        let expected = builder
+            .op(0) // {
+            .string(1, "versions")
+            .op(1) // :
+            .op(0) // {
+            .string(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .op(1) // :
+            .op(0) // {
+            .op(0) // }
+            .op(0) // ,
+            .string(1, "bcdefghijkabc♥♥")
+            .op(1) // :
+            .op(0) // {
+            .op(0) // }
+            .op(0) // }
+            .op(0) // }
+            .build();
+        assert_tokens_eq(input, expected);
+    }
+
+    #[test]
+    fn test_pluck_versions() {
+        let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkabc♥♥":{}}}"#;
+        let (versions, version_ranges) = pluck_versions(input);
+        assert_eq!(
+            versions,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bcdefghijkabc♥♥"]
+        );
     }
 }

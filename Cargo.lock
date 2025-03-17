@@ -240,6 +240,7 @@ version = "0.1.0"
 dependencies = [
  "arrayref",
  "deno_npm",
+ "deno_semver",
  "divan",
  "pretty_assertions",
  "rustc-hash",
