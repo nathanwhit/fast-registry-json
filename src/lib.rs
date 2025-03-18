@@ -697,18 +697,20 @@ impl<'a> Tokenizer<'a> {
             strings = strings & mask;
         }
         let wrote = bit_indexer.write(self.idx, ops | strings, strings);
-
+        self.tokens.reserve(wrote);
         let mut found_end = false;
         let mut did_write_string = false;
         let mut i = 0;
-        while likely(i < wrote) {
+        let mut t = 0;
+        let tokens_rest = self.tokens.spare_capacity_mut();
+        while i < wrote {
             let index = self.buf[i as usize];
             match index.kind() {
                 TypedIndexKind::Operator => {
                     let start = index.index();
                     let end = start + 1;
-                    self.tokens
-                        .push(Token::new(start, end, TokenKind::Operator));
+                    tokens_rest[t].write(Token::new(start, end, TokenKind::Operator));
+                    t += 1;
                     i += 1;
                 }
                 TypedIndexKind::Quote => {
@@ -718,20 +720,23 @@ impl<'a> Tokenizer<'a> {
                     // find the end of the string
                     let mut end = start;
                     i += 1;
-                    if likely(i < wrote)
-                        && likely(self.buf[i as usize].kind() == TypedIndexKind::Quote)
-                    {
+                    if i < wrote && self.buf[i as usize].kind() == TypedIndexKind::Quote {
                         end = self.buf[i as usize].index();
                         i += 1;
                         found_end = true;
                     }
-                    self.tokens.push(Token::new(
+                    tokens_rest[t].write(Token::new(
                         start + 1,
                         if end == start { start + 1 } else { end },
                         TokenKind::String,
                     ));
+                    t += 1;
                 }
             }
+        }
+        let orig_len = self.tokens.len();
+        unsafe {
+            self.tokens.set_len(orig_len + t);
         }
 
         if did_write_string && !found_end {
@@ -761,25 +766,6 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-#[inline]
-#[cold]
-fn cold() {}
-
-#[inline]
-fn likely(b: bool) -> bool {
-    if !b {
-        cold()
-    }
-    b
-}
-
-#[inline]
-fn unlikely(b: bool) -> bool {
-    if b {
-        cold()
-    }
-    b
-}
 pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: Vec<Token>) -> Versions<'i> {
     enum State<'i> {
         Start,
