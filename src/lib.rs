@@ -546,11 +546,8 @@ impl<'a> BitIndexer<'a> {
     }
 
     pub fn write_index(&mut self, index: u32, rev_bits: &mut u64, i: usize, quotes: u64) {
-        if *rev_bits == 0 {
-            return;
-        }
         let lz = rev_bits.leading_zeros();
-        let is_quote = quotes & (1 << lz) != 0;
+        let is_quote = quotes & (1u64.wrapping_shl(lz)) != 0;
         unsafe {
             *self.tail.get_unchecked_mut(self.idx + i) = TypedIndex::new(
                 index + lz,
