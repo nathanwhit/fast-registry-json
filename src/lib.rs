@@ -1,6 +1,4 @@
-use std::marker::PhantomData;
-
-use simd::{Simd8, Simd8x64, make_uint8x16_t};
+use simd::{Simd8, Simd8x64};
 
 pub mod simd;
 
@@ -63,16 +61,16 @@ struct EscapedAndEscape {
      * ```
      */
     escaped: u64,
-    /**
-     * Mask of escape characters.
-     *
-     * ```ignore
-     * \n \\n \\\n \\\\n \
-     * 1001000101001010001
-     * \  \   \ \  \ \   \
-     * ```
-     */
-    escape: u64,
+    // /**
+    //  * Mask of escape characters.
+    //  *
+    //  * ```ignore
+    //  * \n \\n \\\n \\\\n \
+    //  * 1001000101001010001
+    //  * \  \   \ \  \ \   \
+    //  * ```
+    //  */
+    // escape: u64,
 }
 
 impl JsonEscapeScanner {
@@ -102,7 +100,7 @@ impl JsonEscapeScanner {
         let escaped = escape_and_terminal_code ^ (backslash | self.next_is_escaped);
         let escape = escape_and_terminal_code & backslash;
         self.next_is_escaped = escape >> 63;
-        EscapedAndEscape { escaped, escape }
+        EscapedAndEscape { escaped }
     }
 
     /**
@@ -302,6 +300,7 @@ mod classify {
 
     #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
     pub fn classify(input: &simd::Simd8x64<u8>) -> JsonCharacterBlock {
+        use simd::make_uint8x16_t;
         let table1 = make_uint8x16_t(16, 0, 0, 0, 0, 0, 0, 0, 0, 8, 12, 1, 2, 9, 0, 0).into();
         let table2 = make_uint8x16_t(8, 0, 18, 4, 0, 1, 0, 1, 0, 0, 0, 3, 2, 1, 0, 0).into();
 
@@ -595,7 +594,7 @@ impl<'a> BitIndexer<'a> {
 
         self.write_indexes_stepped(index, &mut rev_bits, cnt as usize, 0, 24, quotes);
 
-        if 24 < cnt {
+        if cnt > 24 {
             for i in 24..cnt {
                 self.write_index(index, &mut rev_bits, i as usize, quotes);
             }
@@ -653,7 +652,7 @@ pub enum TokenKind {
 pub struct Tokenizer<'a> {
     scanner: JsonScanner,
     tokens: Vec<Token>,
-    buf: Vec<TypedIndex>,
+    buf: [TypedIndex; 64],
 
     block_reader: BufBlockReader<'a, 64>,
     idx: u32,
@@ -668,8 +667,8 @@ impl<'a> Tokenizer<'a> {
         }
         Self {
             scanner: JsonScanner::new(),
-            tokens: Vec::with_capacity(input.len() / 3),
-            buf: vec![TypedIndex::ZERO; 64 * 3],
+            tokens: Vec::with_capacity(input.len() / 4),
+            buf: [TypedIndex::ZERO; 64],
             block_reader: BufBlockReader::new(input),
             idx: 0,
             incomplete_string: false,
@@ -687,14 +686,8 @@ impl<'a> Tokenizer<'a> {
             if pos == 0 {
                 return;
             }
-            // let pos = pos - 1;
             let last = self.tokens.len() - 1;
             self.tokens[last].set_end(self.idx + (64 - pos));
-            // eprintln!(
-            //     "{}",
-            //     self.tokens[last].value(unsafe { std::str::from_utf8_unchecked(self.input) })
-            // );
-            // eprintln!("pos: {}", pos);
             let mask = if pos <= 1 {
                 0
             } else {
@@ -704,11 +697,6 @@ impl<'a> Tokenizer<'a> {
             strings = strings & mask;
         }
         let wrote = bit_indexer.write(self.idx, ops | strings, strings);
-        // let mut bit_indexer = BitIndexer::new(&mut self.buf[wrote_ops + wrote_strings..]);
-        // let wrote_scalars = bit_indexer.write(
-        //     self.idx,
-        //     json_block.potential_scalar_start() & !strings & !json_block.string.quote,
-        // );
 
         let mut found_end = false;
         let mut did_write_string = false;
