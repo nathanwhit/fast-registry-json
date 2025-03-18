@@ -500,7 +500,7 @@ fn follows(match_mask: u64, overflow: &mut u64) -> u64 {
 }
 
 pub struct BitIndexer<'a> {
-    tail: &'a mut [u32],
+    tail: &'a mut [TypedIndex],
     idx: usize,
 }
 
@@ -508,27 +508,67 @@ fn zero_leading_bit(rev_bits: u64, leading_zeroes: u32) -> u64 {
     rev_bits ^ (0x8000000000000000u64.wrapping_shr(leading_zeroes))
 }
 
+#[derive(Default, Clone, Copy)]
+pub struct TypedIndex {
+    data: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypedIndexKind {
+    Operator = 0,
+    Quote = 1,
+}
+
+impl TypedIndex {
+    const ZERO: Self = Self { data: 0 };
+    fn new(index: u32, kind: TypedIndexKind) -> Self {
+        Self {
+            data: (index & 0x7FFFFFFF) | ((kind as u32) << 31),
+        }
+    }
+
+    fn index(&self) -> u32 {
+        self.data & 0x7FFFFFFF
+    }
+
+    fn kind(&self) -> TypedIndexKind {
+        match self.data >> 31 {
+            0 => TypedIndexKind::Operator,
+            1 => TypedIndexKind::Quote,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+}
+
 impl<'a> BitIndexer<'a> {
-    pub fn new(tail: &'a mut [u32]) -> Self {
+    pub fn new(tail: &'a mut [TypedIndex]) -> Self {
         Self { tail, idx: 0 }
     }
 
-    pub fn write_index(&mut self, index: u32, rev_bits: &mut u64, i: usize) {
+    pub fn write_index(&mut self, index: u32, rev_bits: &mut u64, i: usize, quotes: u64) {
         if *rev_bits == 0 {
             return;
         }
         let lz = rev_bits.leading_zeros();
+        let is_quote = quotes & (1 << lz) != 0;
         unsafe {
-            *self.tail.get_unchecked_mut(self.idx + i) = index + lz;
+            *self.tail.get_unchecked_mut(self.idx + i) = TypedIndex::new(
+                index + lz,
+                if is_quote {
+                    TypedIndexKind::Quote
+                } else {
+                    TypedIndexKind::Operator
+                },
+            );
         }
         *rev_bits = zero_leading_bit(*rev_bits, lz);
     }
 
-    pub fn write_indexes(&mut self, index: u32, rev_bits: &mut u64, start: usize) {
-        self.write_index(index, rev_bits, start);
-        self.write_index(index, rev_bits, start + 1);
-        self.write_index(index, rev_bits, start + 2);
-        self.write_index(index, rev_bits, start + 3);
+    pub fn write_indexes(&mut self, index: u32, rev_bits: &mut u64, start: usize, quotes: u64) {
+        self.write_index(index, rev_bits, start, quotes);
+        self.write_index(index, rev_bits, start + 1, quotes);
+        self.write_index(index, rev_bits, start + 2, quotes);
+        self.write_index(index, rev_bits, start + 3, quotes);
     }
 
     pub fn write_indexes_stepped(
@@ -538,16 +578,17 @@ impl<'a> BitIndexer<'a> {
         cnt: usize,
         start: usize,
         end: usize,
+        quotes: u64,
     ) {
-        self.write_indexes(index, rev_bits, start);
+        self.write_indexes(index, rev_bits, start, quotes);
         if start + 4 < end {
             if start + 4 < cnt {
-                self.write_indexes_stepped(index, rev_bits, cnt, start + 4, end);
+                self.write_indexes_stepped(index, rev_bits, cnt, start + 4, end, quotes);
             }
         }
     }
 
-    pub fn write(&mut self, index: u32, bits: u64) -> usize {
+    pub fn write(&mut self, index: u32, bits: u64, quotes: u64) -> usize {
         if bits == 0 {
             return 0;
         }
@@ -555,11 +596,11 @@ impl<'a> BitIndexer<'a> {
         let cnt = bits.count_ones();
         let mut rev_bits = bits.reverse_bits();
 
-        self.write_indexes_stepped(index, &mut rev_bits, cnt as usize, 0, 24);
+        self.write_indexes_stepped(index, &mut rev_bits, cnt as usize, 0, 24, quotes);
 
         if 24 < cnt {
             for i in 24..cnt {
-                self.write_index(index, &mut rev_bits, i as usize);
+                self.write_index(index, &mut rev_bits, i as usize, quotes);
             }
         }
 
@@ -608,23 +649,19 @@ impl Token {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
-    Operator,
-    String,
+    Operator = 0,
+    String = 1,
     // Scalar,
 }
 pub struct Tokenizer<'a> {
     scanner: JsonScanner,
     tokens: Vec<Token>,
-    buf: Vec<u32>,
-
-    num_tokens: usize,
+    buf: Vec<TypedIndex>,
 
     block_reader: BufBlockReader<'a, 64>,
     idx: u32,
 
     incomplete_string: bool,
-
-    input: &'a [u8],
 }
 
 impl<'a> Tokenizer<'a> {
@@ -635,23 +672,18 @@ impl<'a> Tokenizer<'a> {
         Self {
             scanner: JsonScanner::new(),
             tokens: Vec::with_capacity(input.len() / 3),
-            buf: vec![0; 64 * 3],
+            buf: vec![TypedIndex::ZERO; 64 * 3],
             block_reader: BufBlockReader::new(input),
             idx: 0,
             incomplete_string: false,
-            input,
-            num_tokens: 0,
         }
     }
 
-    fn process_json_block(&mut self, json_block: JsonBlock, block: &simd::Simd8x64<u8>) {
+    fn process_json_block(&mut self, json_block: JsonBlock) {
         let mut bit_indexer = BitIndexer::new(&mut self.buf);
 
         let ops = json_block.characters.op() & !json_block.string.in_string;
         let mut strings = json_block.string.quote;
-
-        let wrote_ops = bit_indexer.write(self.idx, ops);
-        let mut bit_indexer = BitIndexer::new(&mut self.buf[wrote_ops..]);
 
         if self.incomplete_string {
             let pos = 64 - json_block.string.quote.trailing_zeros();
@@ -674,47 +706,49 @@ impl<'a> Tokenizer<'a> {
             self.incomplete_string = false;
             strings = strings & mask;
         }
-        let wrote_strings = bit_indexer.write(self.idx, strings);
+        let wrote = bit_indexer.write(self.idx, ops | strings, strings);
         // let mut bit_indexer = BitIndexer::new(&mut self.buf[wrote_ops + wrote_strings..]);
         // let wrote_scalars = bit_indexer.write(
         //     self.idx,
         //     json_block.potential_scalar_start() & !strings & !json_block.string.quote,
         // );
 
-        let num_tokens = self.tokens.len();
-        for i in 0..wrote_ops {
-            let start = self.buf[i as usize];
-            let end = start + 1;
-            self.tokens
-                .push(Token::new(start, end, TokenKind::Operator));
-        }
-
-        let mut i = wrote_ops;
         let mut found_end = false;
-        while i < wrote_ops + wrote_strings {
-            let start = self.buf[i as usize];
-            found_end = false;
-            // find the end of the string
-            let mut end = start;
-            i += 1;
-            if i < wrote_ops + wrote_strings {
-                end = self.buf[i as usize];
-                i += 1;
-                found_end = true;
+        let mut did_write_string = false;
+        let mut i = 0;
+        while i < wrote {
+            let index = self.buf[i as usize];
+            match index.kind() {
+                TypedIndexKind::Operator => {
+                    let start = index.index();
+                    let end = start + 1;
+                    self.tokens
+                        .push(Token::new(start, end, TokenKind::Operator));
+                    i += 1;
+                }
+                TypedIndexKind::Quote => {
+                    did_write_string = true;
+                    let start = index.index();
+                    found_end = false;
+                    // find the end of the string
+                    let mut end = start;
+                    i += 1;
+                    if i < wrote && self.buf[i as usize].kind() == TypedIndexKind::Quote {
+                        end = self.buf[i as usize].index();
+                        i += 1;
+                        found_end = true;
+                    }
+                    self.tokens.push(Token::new(
+                        start + 1,
+                        if end == start { start + 1 } else { end },
+                        TokenKind::String,
+                    ));
+                }
             }
-            self.tokens.push(Token::new(
-                start + 1,
-                if end == start { start + 1 } else { end },
-                TokenKind::String,
-            ));
         }
 
-        self.tokens[num_tokens..].sort_unstable_by_key(|t| t.start());
-
-        if wrote_strings > 0 {
-            if !found_end {
-                self.incomplete_string = true;
-            }
+        if did_write_string && !found_end {
+            self.incomplete_string = true;
         }
     }
 
@@ -724,7 +758,7 @@ impl<'a> Tokenizer<'a> {
             let block = simd::Simd8x64::<u8>::load(arrayref::array_ref![block, 0, 64]);
             let json_block = self.scanner.next(&block);
             self.block_reader.advance();
-            self.process_json_block(json_block, &block);
+            self.process_json_block(json_block);
             self.idx += 64;
         }
 
@@ -733,7 +767,7 @@ impl<'a> Tokenizer<'a> {
         let block = simd::Simd8x64::<u8>::load(arrayref::array_ref![&remainder_buf, 0, 64]);
         let json_block = self.scanner.next(&block);
         self.block_reader.advance();
-        self.process_json_block(json_block, &block);
+        self.process_json_block(json_block);
         self.idx += 64;
         self.scanner.finish()?;
         Ok(self.tokens)
@@ -1010,6 +1044,19 @@ mod tests {
             .op(0)
             .op(0)
             .op(0)
+            .build();
+        assert_tokens_eq(input, expected);
+    }
+
+    #[test]
+    fn small_input() {
+        let input = r#"{"foo":"bar"}"#;
+        let expected = TokensBuilder::new()
+            .op(0)
+            .string(1, "foo")
+            .op(1)
+            .string(1, "bar")
+            .op(1)
             .build();
         assert_tokens_eq(input, expected);
     }
