@@ -780,7 +780,7 @@ fn unlikely(b: bool) -> bool {
     }
     b
 }
-pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Versions<'i> {
+pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: Vec<Token>) -> Versions<'i> {
     enum State<'i> {
         Start,
         InVersions,
@@ -799,15 +799,19 @@ pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Versi
     for token in tokens {
         match token.kind() {
             TokenKind::String => {
-                let v = token.value(input_bytes);
-                if object_depth == 1 && v == b"versions" {
-                    state = State::InVersions;
+                if object_depth == 1 {
+                    let v: &[u8] = token.value(input_bytes);
+                    if v == b"versions" {
+                        state = State::InVersions;
+                    } else if v == b"dist-tags" {
+                        state = State::InDistTags;
+                    }
                 } else if object_depth == 2 && matches!(state, State::InVersions) {
+                    let v: &[u8] = token.value(input_bytes);
                     versions.push(unsafe { std::str::from_utf8_unchecked(v) });
                     state = State::WantVersion;
-                } else if object_depth == 1 && v == b"dist-tags" {
-                    state = State::InDistTags;
                 } else if object_depth == 2 && matches!(state, State::InDistTags) {
+                    let v: &[u8] = token.value(input_bytes);
                     let key = unsafe { std::str::from_utf8_unchecked(v) };
                     dist_tags.insert(key, "");
                     state = State::WantDistTagValue(key);
@@ -815,6 +819,7 @@ pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Versi
                     if let State::WantDistTagValue(key) = state {
                         let dist_tag = dist_tags.get_mut(key);
                         if let Some(dist_tag) = dist_tag {
+                            let v: &[u8] = token.value(input_bytes);
                             *dist_tag = unsafe { std::str::from_utf8_unchecked(v) };
                         }
                         state = State::InDistTags;
@@ -863,7 +868,7 @@ pub struct Versions<'i> {
 pub fn pluck_versions<'i>(input: &'i str) -> Versions<'i> {
     let tokenizer = Tokenizer::new(input.as_bytes());
     let tokens = tokenizer.tokenize().unwrap();
-    pluck_versions_from_tokens(input, &tokens)
+    pluck_versions_from_tokens(input, tokens)
 }
 
 #[cfg(test)]
