@@ -164,6 +164,12 @@ impl_wrapper!(Simd8<u8>);
 
 impl Simd8<u8> {
     #[inline(always)]
+    /// Loads a uint8x16_t from a pointer.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be valid and aligned,
+    /// and must point to an array of at least 16 u8s
     pub unsafe fn load(values: *const u8) -> uint8x16_t {
         unsafe { vld1q_u8(values) }
     }
@@ -187,7 +193,7 @@ impl Simd8<u8> {
 impl From<u8> for Simd8<u8> {
     #[inline(always)]
     fn from(value: u8) -> Self {
-        Self::splat(value).into()
+        Self::splat(value)
     }
 }
 
@@ -223,6 +229,7 @@ impl Simd8<bool> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub fn make_uint8x16_t(
     a: u8,
@@ -285,7 +292,7 @@ pub trait Splat<T> {
 impl Splat<u8> for Simd8<u8> {
     #[inline(always)]
     fn splat(value: u8) -> Simd8<u8> {
-        Simd8::<u8>::splat(value).into()
+        Simd8::<u8>::splat(value)
     }
 }
 
@@ -311,7 +318,7 @@ impl WrapsBaseU8<bool> for Simd8<bool> {
 impl From<uint8x16_t> for Simd8<bool> {
     #[inline(always)]
     fn from(value: uint8x16_t) -> Self {
-        Self::from_base(value.into()).into()
+        Self::from_base(value.into())
     }
 }
 
@@ -382,6 +389,7 @@ impl Simd8<u8> {
         table.apply_lookup_16_to(*self)
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     pub fn lookup_16(
         &self,

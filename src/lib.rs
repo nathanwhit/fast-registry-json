@@ -166,7 +166,7 @@ impl JsonEscapeScanner {
         // - Makes even runs of backslashes go from 1111 to 1010
         // - Sets actually-escaped codes to 1 (the n in \n and \\n: \n = 11, \\n = 100)
         // - Resets all other bytes to 0
-        return even_series_codes_and_odd_bits ^ ODD_BITS;
+        even_series_codes_and_odd_bits ^ ODD_BITS
     }
 }
 
@@ -231,6 +231,12 @@ pub struct JsonStringScanner {
     escape_scanner: JsonEscapeScanner,
     // Whether the last iteration was still inside a string (all 1's = true, all 0's = false).
     prev_in_string: u64,
+}
+
+impl Default for JsonStringScanner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JsonStringScanner {
@@ -446,7 +452,7 @@ impl JsonBlock {
 /// in particular, the operator/scalar bit will find plenty of things that are actually part of
 /// strings. When we're done, JsonBlock will fuse the two together by masking out tokens that are
 /// part of a string.
-pub struct JsonScanner {
+pub(crate) struct JsonScanner {
     /// Whether the last character of the previous iteration is part of a scalar token
     /// (anything except whitespace or a structural character/'operator').
     prev_scalar: u64,
@@ -577,10 +583,8 @@ impl<'a> BitIndexer<'a> {
         quotes: u64,
     ) {
         self.write_indexes(index, rev_bits, start, quotes);
-        if start + 4 < end {
-            if start + 4 < cnt {
-                self.write_indexes_stepped(index, rev_bits, cnt, start + 4, end, quotes);
-            }
+        if start + 4 < end && start + 4 < cnt {
+            self.write_indexes_stepped(index, rev_bits, cnt, start + 4, end, quotes);
         }
     }
 
@@ -627,7 +631,7 @@ impl Token {
     }
 
     pub fn set_end(&mut self, end: u32) {
-        self.data = (self.data & 0x80000000_FFFFFFFF) | ((end as u64) & 0x7FFFFFFFFFFFFFFF) << 32;
+        self.data = (self.data & 0x80000000_FFFFFFFF) | (((end as u64) & 0x7FFFFFFFFFFFFFFF) << 32);
     }
 
     pub fn kind(self) -> TokenKind {
@@ -694,7 +698,7 @@ impl<'a> Tokenizer<'a> {
                 (!0u64) << ((64 - pos) + 1)
             };
             self.incomplete_string = false;
-            strings = strings & mask;
+            strings &= mask;
         }
         let wrote = bit_indexer.write(self.idx, ops | strings, strings);
         self.tokens.reserve(wrote);
@@ -704,7 +708,7 @@ impl<'a> Tokenizer<'a> {
         let mut t = 0;
         let tokens_rest = self.tokens.spare_capacity_mut();
         while i < wrote {
-            let index = self.buf[i as usize];
+            let index = self.buf[i];
             match index.kind() {
                 TypedIndexKind::Operator => {
                     let start = index.index();
@@ -720,8 +724,8 @@ impl<'a> Tokenizer<'a> {
                     // find the end of the string
                     let mut end = start;
                     i += 1;
-                    if i < wrote && self.buf[i as usize].kind() == TypedIndexKind::Quote {
-                        end = self.buf[i as usize].index();
+                    if i < wrote && self.buf[i].kind() == TypedIndexKind::Quote {
+                        end = self.buf[i].index();
                         i += 1;
                         found_end = true;
                     }
@@ -766,7 +770,7 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: Vec<Token>) -> Versions<'i> {
+pub fn pluck_versions_from_tokens(input: &str, tokens: Vec<Token>) -> Versions<'_> {
     enum State<'i> {
         Start,
         InVersions,
@@ -820,9 +824,7 @@ pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: Vec<Token>) -> Ver
                         version_ranges.push((token.start(), token.end()));
                     }
                 } else if v == b'}' {
-                    if object_depth == 2 && matches!(state, State::InVersions) {
-                        state = State::Start;
-                    } else if object_depth == 2 && matches!(state, State::InDistTags) {
+                    if object_depth == 2 && matches!(state, State::InVersions | State::InDistTags) {
                         state = State::Start;
                     } else if object_depth == 3 && matches!(state, State::WantVersion) {
                         let last = version_ranges.len() - 1;
@@ -851,7 +853,7 @@ pub struct Versions<'i> {
     pub dist_tags: rustc_hash::FxHashMap<&'i str, &'i str>,
 }
 
-pub fn pluck_versions<'i>(input: &'i str) -> Versions<'i> {
+pub fn pluck_versions(input: &str) -> Versions<'_> {
     let tokenizer = Tokenizer::new(input.as_bytes());
     let tokens = tokenizer.tokenize().unwrap();
     pluck_versions_from_tokens(input, tokens)
