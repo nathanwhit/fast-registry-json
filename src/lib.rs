@@ -619,10 +619,10 @@ impl Token {
         }
     }
 
-    pub fn start(&self) -> u32 {
+    pub fn start(self) -> u32 {
         (self.data & 0xFFFFFFFF) as u32
     }
-    pub fn end(&self) -> u32 {
+    pub fn end(self) -> u32 {
         ((self.data & 0x7FFFFFFFFFFFFFFF) >> 32) as u32
     }
 
@@ -630,7 +630,7 @@ impl Token {
         self.data = (self.data & 0x80000000_FFFFFFFF) | ((end as u64) & 0x7FFFFFFFFFFFFFFF) << 32;
     }
 
-    pub fn kind(&self) -> TokenKind {
+    pub fn kind(self) -> TokenKind {
         match self.data >> 63 {
             0 => TokenKind::Operator,
             1 => TokenKind::String,
@@ -701,7 +701,7 @@ impl<'a> Tokenizer<'a> {
         let mut found_end = false;
         let mut did_write_string = false;
         let mut i = 0;
-        while i < wrote {
+        while likely(i < wrote) {
             let index = self.buf[i as usize];
             match index.kind() {
                 TypedIndexKind::Operator => {
@@ -718,7 +718,9 @@ impl<'a> Tokenizer<'a> {
                     // find the end of the string
                     let mut end = start;
                     i += 1;
-                    if i < wrote && self.buf[i as usize].kind() == TypedIndexKind::Quote {
+                    if likely(i < wrote)
+                        && likely(self.buf[i as usize].kind() == TypedIndexKind::Quote)
+                    {
                         end = self.buf[i as usize].index();
                         i += 1;
                         found_end = true;
@@ -759,6 +761,25 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+#[inline]
+#[cold]
+fn cold() {}
+
+#[inline]
+fn likely(b: bool) -> bool {
+    if !b {
+        cold()
+    }
+    b
+}
+
+#[inline]
+fn unlikely(b: bool) -> bool {
+    if b {
+        cold()
+    }
+    b
+}
 pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Versions<'i> {
     enum State<'i> {
         Start,
