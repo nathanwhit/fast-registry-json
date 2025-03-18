@@ -17,9 +17,10 @@ fn bench_pluck_versions(b: Bencher) {
     .unwrap();
     b.bench(|| {
         black_box({
-            let (versions, version_ranges) = fast_registry_json::pluck_versions(&input);
-            let mut map = FxHashMap::with_capacity_and_hasher(versions.len(), Default::default());
-            for (version, range) in versions.into_iter().zip(version_ranges) {
+            let versions = fast_registry_json::pluck_versions(&input);
+            let mut map =
+                FxHashMap::with_capacity_and_hasher(versions.versions.len(), Default::default());
+            for (version, range) in versions.versions.into_iter().zip(versions.version_ranges) {
                 map.insert(version, range);
             }
             let &(start, end) = map.get("15.0.0-canary.202").unwrap();

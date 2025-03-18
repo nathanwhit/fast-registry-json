@@ -160,7 +160,8 @@ impl JsonEscapeScanner {
         // - Odd runs of backslashes are 1111, and the code at the end ("n" in \n or \\n) is 0.
         // - All other odd bytes are 1, and even bytes are 0.
         let maybe_escaped_and_odd_bits = maybe_escaped | ODD_BITS;
-        let even_series_codes_and_odd_bits = maybe_escaped_and_odd_bits - potential_escape;
+        let even_series_codes_and_odd_bits =
+            maybe_escaped_and_odd_bits.wrapping_sub(potential_escape);
 
         // Now we flip all odd bytes back with xor. This:
         // - Makes odd runs of backslashes go from 0000 to 1010
@@ -647,7 +648,7 @@ impl<'a> Tokenizer<'a> {
         let mut bit_indexer = BitIndexer::new(&mut self.buf);
 
         let ops = json_block.characters.op() & !json_block.string.in_string;
-        let mut strings = json_block.string.in_string & !json_block.string.quote;
+        let mut strings = json_block.string.quote;
 
         let wrote_ops = bit_indexer.write(self.idx, ops);
         let mut bit_indexer = BitIndexer::new(&mut self.buf[wrote_ops..]);
@@ -689,43 +690,32 @@ impl<'a> Tokenizer<'a> {
         }
 
         let mut i = wrote_ops;
-        let mut last_end = 0;
+        let mut found_end = false;
         while i < wrote_ops + wrote_strings {
             let start = self.buf[i as usize];
+            found_end = false;
             // find the end of the string
             let mut end = start;
             i += 1;
-            while i < wrote_ops + wrote_strings && self.buf[i as usize] == end + 1 {
+            if i < wrote_ops + wrote_strings {
                 end = self.buf[i as usize];
                 i += 1;
+                found_end = true;
             }
-            last_end = end;
-            self.tokens
-                .push(Token::new(start, end + 1, TokenKind::String));
+            self.tokens.push(Token::new(
+                start + 1,
+                if end == start { start + 1 } else { end },
+                TokenKind::String,
+            ));
         }
 
         self.tokens[num_tokens..].sort_unstable_by_key(|t| t.start());
 
         if wrote_strings > 0 {
-            let last_mask = 0x8000000000000000;
-
-            if last_end - self.idx == 63
-                && (last_mask & strings | json_block.string.quote) != 0
-                && (last_mask & json_block.string.quote) == 0
-            {
+            if !found_end {
                 self.incomplete_string = true;
             }
         }
-
-        // for i in wrote_ops + wrote_strings..wrote_ops + wrote_strings + wrote_scalars {
-        //     let start = self.buf[i as usize];
-        //     let end = start + 1;
-        //     self.tokens.push(Token {
-        //         start,
-        //         end,
-        //         kind: TokenKind::Scalar,
-        //     });
-        // }
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Token>, Error> {
@@ -750,30 +740,45 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-pub fn pluck_versions_from_tokens<'i>(
-    input: &'i str,
-    tokens: &[Token],
-) -> (Vec<&'i str>, Vec<(u32, u32)>) {
-    enum State {
+pub fn pluck_versions_from_tokens<'i>(input: &'i str, tokens: &[Token]) -> Versions<'i> {
+    enum State<'i> {
         Start,
         InVersions,
         WantVersion,
+        InDistTags,
+        WantDistTagValue(&'i str),
     }
     let mut state = State::Start;
     let mut versions = Vec::new();
 
     let mut version_ranges = Vec::new();
+
+    let mut dist_tags = rustc_hash::FxHashMap::<&str, &str>::default();
     let mut object_depth = 0;
     let input_bytes = input.as_bytes();
     for token in tokens {
         match token.kind() {
             TokenKind::String => {
-                if object_depth == 1 && token.value(input_bytes) == b"versions" {
+                let v = token.value(input_bytes);
+                if object_depth == 1 && v == b"versions" {
                     state = State::InVersions;
                 } else if object_depth == 2 && matches!(state, State::InVersions) {
-                    versions
-                        .push(unsafe { std::str::from_utf8_unchecked(token.value(input_bytes)) });
+                    versions.push(unsafe { std::str::from_utf8_unchecked(v) });
                     state = State::WantVersion;
+                } else if object_depth == 1 && v == b"dist-tags" {
+                    state = State::InDistTags;
+                } else if object_depth == 2 && matches!(state, State::InDistTags) {
+                    let key = unsafe { std::str::from_utf8_unchecked(v) };
+                    dist_tags.insert(key, "");
+                    state = State::WantDistTagValue(key);
+                } else if object_depth == 2 {
+                    if let State::WantDistTagValue(key) = state {
+                        let dist_tag = dist_tags.get_mut(key);
+                        if let Some(dist_tag) = dist_tag {
+                            *dist_tag = unsafe { std::str::from_utf8_unchecked(v) };
+                        }
+                        state = State::InDistTags;
+                    }
                 }
             }
             TokenKind::Operator => {
@@ -785,6 +790,8 @@ pub fn pluck_versions_from_tokens<'i>(
                     }
                 } else if v == b'}' {
                     if object_depth == 2 && matches!(state, State::InVersions) {
+                        state = State::Start;
+                    } else if object_depth == 2 && matches!(state, State::InDistTags) {
                         state = State::Start;
                     } else if object_depth == 3 && matches!(state, State::WantVersion) {
                         let last = version_ranges.len() - 1;
@@ -800,10 +807,20 @@ pub fn pluck_versions_from_tokens<'i>(
             }
         }
     }
-    (versions, version_ranges)
+    Versions {
+        versions,
+        version_ranges,
+        dist_tags,
+    }
 }
 
-pub fn pluck_versions(input: &str) -> (Vec<&str>, Vec<(u32, u32)>) {
+pub struct Versions<'i> {
+    pub versions: Vec<&'i str>,
+    pub version_ranges: Vec<(u32, u32)>,
+    pub dist_tags: rustc_hash::FxHashMap<&'i str, &'i str>,
+}
+
+pub fn pluck_versions<'i>(input: &'i str) -> Versions<'i> {
     let tokenizer = Tokenizer::new(input.as_bytes());
     let tokens = tokenizer.tokenize().unwrap();
     pluck_versions_from_tokens(input, &tokens)
@@ -965,11 +982,35 @@ mod tests {
 
     #[test]
     fn test_pluck_versions() {
-        let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkabc♥♥":{}}}"#;
-        let (versions, version_ranges) = pluck_versions(input);
+        let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkabc♥♥":{}},"dist-tags":{"latest":"foo","bar":"baz"}}"#;
+        let versions = pluck_versions(input);
         assert_eq!(
-            versions,
+            versions.versions,
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bcdefghijkabc♥♥"]
         );
+        assert_eq!(
+            versions.dist_tags,
+            vec![("latest", "foo"), ("bar", "baz")]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn escaped_quotes() {
+        let input = r#"{"versions":{"aaa\"bbb":{}}}"#;
+        let expected = TokensBuilder::new()
+            .op(0)
+            .string(1, "versions")
+            .op(1)
+            .op(0)
+            .string(1, r#"aaa\"bbb"#)
+            .op(1)
+            .op(0)
+            .op(0)
+            .op(0)
+            .op(0)
+            .build();
+        assert_tokens_eq(input, expected);
     }
 }
