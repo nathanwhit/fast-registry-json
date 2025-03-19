@@ -344,7 +344,7 @@ pub struct JsonCharacterBlock {
 mod classify {
     use super::*;
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+    #[cfg(any(target_arch = "aarch64"))]
     #[inline(always)]
     pub fn classify(input: &simd::Simd8x64<u8>) -> JsonCharacterBlock {
         use simd::width_128::Simd8;
@@ -504,7 +504,7 @@ impl JsonCharacterBlock {
     /// Classify a block of JSON text
     pub fn classify(input: &simd::Simd8x64<u8>) -> Self {
         pick! {
-            if #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec", target_arch = "x86_64"))] {
+            if #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))] {
                 return classify::classify(input);
             } else {
                 unimplemented!()
