@@ -844,6 +844,7 @@ pub(crate) fn pluck_versions_from_tokens(input: &str, tokens: Vec<Token>) -> Ver
             }
             TokenKind::Operator => {
                 let v = input_bytes[token.start() as usize];
+                debug_assert!(v == b'{' || v == b'}' || v == b'[' || v == b']');
                 if v == b'{' {
                     object_depth += 1;
                     if object_depth == 3 && matches!(state, State::WantVersion) {
@@ -857,10 +858,16 @@ pub(crate) fn pluck_versions_from_tokens(input: &str, tokens: Vec<Token>) -> Ver
                         version_ranges[last].1 = token.end();
                         state = State::InVersions;
                     }
+                    if object_depth == 0 {
+                        break;
+                    }
                     object_depth -= 1;
                 } else if v == b'[' {
                     object_depth += 1;
                 } else if v == b']' {
+                    if object_depth == 0 {
+                        break;
+                    }
                     object_depth -= 1;
                 }
             }
@@ -873,16 +880,17 @@ pub(crate) fn pluck_versions_from_tokens(input: &str, tokens: Vec<Token>) -> Ver
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Versions<'i> {
     pub versions: Vec<&'i str>,
     pub version_ranges: Vec<(u32, u32)>,
     pub dist_tags: rustc_hash::FxHashMap<&'i str, &'i str>,
 }
 
-pub fn pluck_versions(input: &str) -> Versions<'_> {
+pub fn pluck_versions(input: &str) -> Result<Versions<'_>, Error> {
     let tokenizer = Tokenizer::<NoCommaOrColon>::new(input.as_bytes());
-    let tokens = tokenizer.tokenize().unwrap();
-    pluck_versions_from_tokens(input, tokens)
+    let tokens = tokenizer.tokenize()?;
+    Ok(pluck_versions_from_tokens(input, tokens))
 }
 
 #[cfg(test)]
@@ -1052,7 +1060,7 @@ mod tests {
     #[test]
     fn test_pluck_versions() {
         let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkabc♥♥":{}},"dist-tags":{"latest":"foo","bar":"baz"}}"#;
-        let versions = pluck_versions(input);
+        let versions = pluck_versions(input).unwrap();
         assert_eq!(
             versions.versions,
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bcdefghijkabc♥♥"]
@@ -1094,5 +1102,18 @@ mod tests {
             .op(1)
             .build();
         assert_tokens_eq(input, expected);
+    }
+
+    #[test]
+    fn invalid_input() {
+        let input = r#"{"versions":{}}}"#;
+        let _versions = pluck_versions(input);
+    }
+
+    #[test]
+    fn unclosed_string() {
+        let input = r#"{"versions:{}}"#;
+        let error = pluck_versions(input).unwrap_err();
+        assert_eq!(error, Error::UnclosedString);
     }
 }
