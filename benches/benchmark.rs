@@ -17,7 +17,7 @@ fn bench_pluck_versions(b: Bencher) {
     let input = std::fs::read_to_string(NEXT_PATH).unwrap();
     b.bench(|| {
         black_box({
-            let versions = fast_registry_json::pluck_versions(&input);
+            let versions = fast_registry_json::pluck_versions(&input).unwrap();
             let mut map =
                 FxHashMap::with_capacity_and_hasher(versions.versions.len(), Default::default());
             for (version, range) in versions.versions.into_iter().zip(versions.version_ranges) {
@@ -54,7 +54,7 @@ fn bench_pluck_versions_prisma(b: Bencher) {
     let input = std::fs::read_to_string(PRISMA_PATH).unwrap();
     b.bench(|| {
         black_box({
-            let versions = fast_registry_json::pluck_versions(&input);
+            let versions = fast_registry_json::pluck_versions(&input).unwrap();
             let mut map =
                 FxHashMap::with_capacity_and_hasher(versions.versions.len(), Default::default());
             for (version, range) in versions.versions.into_iter().zip(versions.version_ranges) {

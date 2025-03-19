@@ -224,6 +224,7 @@ impl JsonStringBlock {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     UnclosedString,
+    UnmatchedBrace(usize),
 }
 
 pub struct JsonStringScanner {
@@ -796,7 +797,10 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
     }
 }
 
-pub(crate) fn pluck_versions_from_tokens(input: &str, tokens: Vec<Token>) -> Versions<'_> {
+pub(crate) fn pluck_versions_from_tokens(
+    input: &str,
+    tokens: Vec<Token>,
+) -> Result<Versions<'_>, Error> {
     enum State<'i> {
         Start,
         InVersions,
@@ -859,25 +863,25 @@ pub(crate) fn pluck_versions_from_tokens(input: &str, tokens: Vec<Token>) -> Ver
                         state = State::InVersions;
                     }
                     if object_depth == 0 {
-                        break;
+                        return Err(Error::UnmatchedBrace(token.start() as usize));
                     }
                     object_depth -= 1;
                 } else if v == b'[' {
                     object_depth += 1;
                 } else if v == b']' {
                     if object_depth == 0 {
-                        break;
+                        return Err(Error::UnmatchedBrace(token.start() as usize));
                     }
                     object_depth -= 1;
                 }
             }
         }
     }
-    Versions {
+    Ok(Versions {
         versions,
         version_ranges,
         dist_tags,
-    }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -890,7 +894,7 @@ pub struct Versions<'i> {
 pub fn pluck_versions(input: &str) -> Result<Versions<'_>, Error> {
     let tokenizer = Tokenizer::<NoCommaOrColon>::new(input.as_bytes());
     let tokens = tokenizer.tokenize()?;
-    Ok(pluck_versions_from_tokens(input, tokens))
+    pluck_versions_from_tokens(input, tokens)
 }
 
 #[cfg(test)]
