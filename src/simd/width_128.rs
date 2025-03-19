@@ -275,6 +275,7 @@ where
         .to_bitmask()
     }
 
+    #[inline(always)]
     pub fn cmp_eq_mask(&self, other: &Simd8x64<T>) -> u64 {
         let a = self.chunks[0].eq_mask(&other.chunks[0]);
         let b = self.chunks[1].eq_mask(&other.chunks[1]);

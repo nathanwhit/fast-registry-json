@@ -487,13 +487,13 @@ impl JsonCharacterBlock {
 
 #[derive(Debug)]
 /// A block of JSON parsing results combining string and character info
-pub struct JsonBlock {
+pub(crate) struct JsonBlock {
     /// String and escape characters
     pub string: JsonStringBlock,
     /// Whitespace, structural characters ('operators'), scalars
     pub characters: JsonCharacterBlock,
-    /// Whether the previous character was a scalar
-    follows_potential_nonquote_scalar: u64,
+    // /// Whether the previous character was a scalar
+    // follows_potential_nonquote_scalar: u64,
 }
 
 impl JsonBlock {
@@ -501,63 +501,63 @@ impl JsonBlock {
     pub fn new(
         string: JsonStringBlock,
         characters: JsonCharacterBlock,
-        follows_potential_nonquote_scalar: u64,
+        // follows_potential_nonquote_scalar: u64,
     ) -> Self {
         Self {
             string,
             characters,
-            follows_potential_nonquote_scalar,
+            // follows_potential_nonquote_scalar,
         }
     }
 
-    /// The start of structurals.
-    /// In simdjson prior to v0.3, these were called the pseudo-structural characters.
-    pub fn structural_start(&self) -> u64 {
-        self.potential_structural_start() & !self.string.string_tail()
-    }
+    // /// The start of structurals.
+    // /// In simdjson prior to v0.3, these were called the pseudo-structural characters.
+    // pub fn structural_start(&self) -> u64 {
+    //     self.potential_structural_start() & !self.string.string_tail()
+    // }
 
-    /// All JSON whitespace (i.e. not in a string)
-    pub fn whitespace(&self) -> u64 {
-        self.non_quote_outside_string(self.characters.whitespace())
-    }
+    // /// All JSON whitespace (i.e. not in a string)
+    // pub fn whitespace(&self) -> u64 {
+    //     self.non_quote_outside_string(self.characters.whitespace())
+    // }
 
-    /// Whether the given characters are inside a string (only works on non-quotes)
-    pub fn non_quote_inside_string(&self, mask: u64) -> u64 {
-        self.string.non_quote_inside_string(mask)
-    }
+    // /// Whether the given characters are inside a string (only works on non-quotes)
+    // pub fn non_quote_inside_string(&self, mask: u64) -> u64 {
+    //     self.string.non_quote_inside_string(mask)
+    // }
 
-    /// Whether the given characters are outside a string (only works on non-quotes)
-    pub fn non_quote_outside_string(&self, mask: u64) -> u64 {
-        self.string.non_quote_outside_string(mask)
-    }
+    // /// Whether the given characters are outside a string (only works on non-quotes)
+    // pub fn non_quote_outside_string(&self, mask: u64) -> u64 {
+    //     self.string.non_quote_outside_string(mask)
+    // }
 
     // ------------ Private methods from C++ implementation ------------
 
-    /// Structural elements ([,],{,},:, comma) plus scalar starts like 123, true and "abc".
-    /// They may reside inside a string.
-    fn potential_structural_start(&self) -> u64 {
-        self.characters.op() | self.potential_scalar_start()
-    }
+    // /// Structural elements ([,],{,},:, comma) plus scalar starts like 123, true and "abc".
+    // /// They may reside inside a string.
+    // fn potential_structural_start(&self) -> u64 {
+    //     self.characters.op() | self.potential_scalar_start()
+    // }
 
-    /// The start of non-operator runs, like 123, true and "abc".
-    /// It may reside inside a string.
-    fn potential_scalar_start(&self) -> u64 {
-        // The term "scalar" refers to anything except structural characters and white space
-        // (so letters, numbers, quotes).
-        // Whenever it is preceded by something that is not a structural element ({,},[,],:, ") nor a white-space
-        // then we know that it is irrelevant structurally.
-        self.characters.scalar() & !self.follows_potential_scalar()
-    }
+    // /// The start of non-operator runs, like 123, true and "abc".
+    // /// It may reside inside a string.
+    // fn potential_scalar_start(&self) -> u64 {
+    //     // The term "scalar" refers to anything except structural characters and white space
+    //     // (so letters, numbers, quotes).
+    //     // Whenever it is preceded by something that is not a structural element ({,},[,],:, ") nor a white-space
+    //     // then we know that it is irrelevant structurally.
+    //     self.characters.scalar() & !self.follows_potential_scalar()
+    // }
 
-    /// Whether the given character is immediately after a non-operator like 123, true.
-    /// The characters following a quote are not included.
-    fn follows_potential_scalar(&self) -> u64 {
-        // follows_potential_nonquote_scalar: is defined as marking any character that follows a character
-        // that is not a structural element ({,},[,],:, comma) nor a quote (") and that is not a
-        // white space.
-        // It is understood that within quoted region, anything at all could be marked (irrelevant).
-        self.follows_potential_nonquote_scalar
-    }
+    // /// Whether the given character is immediately after a non-operator like 123, true.
+    // /// The characters following a quote are not included.
+    // fn follows_potential_scalar(&self) -> u64 {
+    //     // follows_potential_nonquote_scalar: is defined as marking any character that follows a character
+    //     // that is not a structural element ({,},[,],:, comma) nor a quote (") and that is not a
+    //     // white space.
+    //     // It is understood that within quoted region, anything at all could be marked (irrelevant).
+    //     self.follows_potential_nonquote_scalar
+    // }
 }
 
 /// Scans JSON for important bits: structural characters or 'operators', strings, and scalars.
@@ -572,20 +572,21 @@ impl JsonBlock {
 /// strings. When we're done, JsonBlock will fuse the two together by masking out tokens that are
 /// part of a string.
 pub(crate) struct JsonScanner {
-    /// Whether the last character of the previous iteration is part of a scalar token
-    /// (anything except whitespace or a structural character/'operator').
-    prev_scalar: u64,
+    // /// Whether the last character of the previous iteration is part of a scalar token
+    // /// (anything except whitespace or a structural character/'operator').
+    // prev_scalar: u64,
     string_scanner: JsonStringScanner,
 }
 
 impl JsonScanner {
     pub fn new() -> Self {
         Self {
-            prev_scalar: 0,
+            // prev_scalar: 0,
             string_scanner: JsonStringScanner::new(),
         }
     }
 
+    #[inline(always)]
     pub fn next(&mut self, input: &simd::Simd8x64<u8>) -> JsonBlock {
         let strings = self.string_scanner.next(input);
         // Identifies the white-space and the structural characters
@@ -599,35 +600,38 @@ impl JsonScanner {
         // or nothing. However, we still want ' "a string"true ' to mark the 't' of 'true' as a potential
         // pseudo-structural character just like we would if we had  ' "a string" true '; otherwise we
         // may need to add an extra check when parsing strings.
-        let nonquote_scalar = characters.scalar() & !strings.quote();
-        let follows_nonquote_scalar = follows(nonquote_scalar, &mut self.prev_scalar);
+        // let nonquote_scalar = characters.scalar() & !strings.quote();
+        // let follows_nonquote_scalar = follows(nonquote_scalar, &mut self.prev_scalar);
 
-        JsonBlock::new(strings, characters, follows_nonquote_scalar)
+        JsonBlock::new(strings, characters)
     }
 
+    #[inline(always)]
     pub fn finish(&self) -> Result<(), Error> {
         self.string_scanner.finish()
     }
 }
 
-/// Check if the current character immediately follows a matching character.
-///
-/// For example, this checks for quotes with backslashes in front of them:
-///
-/// ```ignore
-/// let backslashed_quote = in.eq('"') & follows(in.eq('\\'), &mut prev_backslash);
-/// ```
-fn follows(match_mask: u64, overflow: &mut u64) -> u64 {
-    let result = (match_mask << 1) | *overflow;
-    *overflow = match_mask >> 63;
-    result
-}
+// /// Check if the current character immediately follows a matching character.
+// ///
+// /// For example, this checks for quotes with backslashes in front of them:
+// ///
+// /// ```ignore
+// /// let backslashed_quote = in.eq('"') & follows(in.eq('\\'), &mut prev_backslash);
+// /// ```
+// #[inline(always)]
+// fn follows(match_mask: u64, overflow: &mut u64) -> u64 {
+//     let result = (match_mask << 1) | *overflow;
+//     *overflow = match_mask >> 63;
+//     result
+// }
 
 pub struct BitIndexer<'a> {
     tail: &'a mut [TypedIndex],
     idx: usize,
 }
 
+#[inline(always)]
 fn zero_leading_bit(rev_bits: u64, leading_zeroes: u32) -> u64 {
     rev_bits ^ (0x8000000000000000u64.wrapping_shr(leading_zeroes))
 }
@@ -645,16 +649,20 @@ enum TypedIndexKind {
 
 impl TypedIndex {
     const ZERO: Self = Self { data: 0 };
+
+    #[inline(always)]
     fn new(index: u32, kind: TypedIndexKind) -> Self {
         Self {
             data: (index & 0x7FFFFFFF) | ((kind as u32) << 31),
         }
     }
 
+    #[inline(always)]
     fn index(&self) -> u32 {
         self.data & 0x7FFFFFFF
     }
 
+    #[inline(always)]
     fn kind(&self) -> TypedIndexKind {
         match self.data >> 31 {
             0 => TypedIndexKind::Operator,
@@ -665,10 +673,12 @@ impl TypedIndex {
 }
 
 impl<'a> BitIndexer<'a> {
+    #[inline(always)]
     pub fn new(tail: &'a mut [TypedIndex]) -> Self {
         Self { tail, idx: 0 }
     }
 
+    #[inline(always)]
     pub fn write_index(&mut self, index: u32, rev_bits: &mut u64, i: usize, quotes: u64) {
         let lz = rev_bits.leading_zeros();
         let is_quote = quotes & (1u64.wrapping_shl(lz)) != 0;
@@ -685,6 +695,7 @@ impl<'a> BitIndexer<'a> {
         *rev_bits = zero_leading_bit(*rev_bits, lz);
     }
 
+    #[inline(always)]
     pub fn write_indexes(&mut self, index: u32, rev_bits: &mut u64, start: usize, quotes: u64) {
         self.write_index(index, rev_bits, start, quotes);
         self.write_index(index, rev_bits, start + 1, quotes);
@@ -692,6 +703,7 @@ impl<'a> BitIndexer<'a> {
         self.write_index(index, rev_bits, start + 3, quotes);
     }
 
+    #[inline(always)]
     pub fn write_indexes_stepped(
         &mut self,
         index: u32,
@@ -703,10 +715,23 @@ impl<'a> BitIndexer<'a> {
     ) {
         self.write_indexes(index, rev_bits, start, quotes);
         if start + 4 < end && start + 4 < cnt {
-            self.write_indexes_stepped(index, rev_bits, cnt, start + 4, end, quotes);
+            self.write_indexes(index, rev_bits, start + 4, quotes);
+        }
+        if start + 8 < end && start + 8 < cnt {
+            self.write_indexes(index, rev_bits, start + 8, quotes);
+        }
+        if start + 12 < end && start + 12 < cnt {
+            self.write_indexes(index, rev_bits, start + 12, quotes);
+        }
+        if start + 16 < end && start + 16 < cnt {
+            self.write_indexes(index, rev_bits, start + 16, quotes);
+        }
+        if start + 20 < end && start + 20 < cnt {
+            self.write_indexes(index, rev_bits, start + 20, quotes);
         }
     }
 
+    #[inline(always)]
     pub fn write(&mut self, index: u32, bits: u64, quotes: u64) -> usize {
         if bits == 0 {
             return 0;
@@ -790,6 +815,7 @@ pub trait CharsEq {
 }
 
 impl CharsEq for simd::Simd8x64<u8> {
+    #[inline(always)]
     fn eq_mask(&self, value: u8) -> u64 {
         self.eq(value)
     }
@@ -801,6 +827,7 @@ pub trait OpMask {
 pub struct NoCommaOrColon;
 
 impl OpMask for NoCommaOrColon {
+    #[inline(always)]
     fn op_mask(b: &impl CharsEq) -> u64 {
         b.eq_mask(b',') | b.eq_mask(b':')
     }
@@ -822,6 +849,7 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
         }
     }
 
+    #[inline(always)]
     fn process_json_block(&mut self, json_block: JsonBlock, dont_care: u64) {
         let mut bit_indexer = BitIndexer::new(&mut self.buf);
 
@@ -856,7 +884,12 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
                 TypedIndexKind::Operator => {
                     let start = index.index();
                     let end = start + 1;
-                    tokens_rest[t].write(Token::new(start, end, TokenKind::Operator));
+                    unsafe {
+                        std::ptr::write(
+                            tokens_rest.as_mut_ptr().add(t).cast(),
+                            Token::new(start, end, TokenKind::Operator),
+                        );
+                    }
                     t += 1;
                     i += 1;
                 }
@@ -872,11 +905,16 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
                         i += 1;
                         found_end = true;
                     }
-                    tokens_rest[t].write(Token::new(
-                        start + 1,
-                        if end == start { start + 1 } else { end },
-                        TokenKind::String,
-                    ));
+                    unsafe {
+                        std::ptr::write(
+                            tokens_rest.as_mut_ptr().add(t).cast(),
+                            Token::new(
+                                start + 1,
+                                if end == start { start + 1 } else { end },
+                                TokenKind::String,
+                            ),
+                        );
+                    }
                     t += 1;
                 }
             }

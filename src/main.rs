@@ -1,14 +1,19 @@
-fn main() {
-    let input = std::fs::read_to_string(
+#[inline(never)]
+fn read_input() -> String {
+    std::fs::read_to_string(
         "/Users/nathanwhit/Library/Caches/deno/npm/registry.npmjs.org/@prisma/client/registry.json",
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn main() {
+    let input = read_input();
     // let input = r#"{ "versions": { "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {}, "bcdefghijkzzzzzzzzzzzzzzzzzzzzzzzzzzz": {} } }"#;
     // let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkabcd":"asdf"}}"#;
     // let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkab":"asdf"}}"#;
 
     // println!("{}", &input[122688 - 32..122688 + 64]);
-    for _ in 0..50 {
+    for _ in 0..1 {
         let _versions = std::hint::black_box(fast_registry_json::pluck_versions(&input));
         // println!("versions: {:?}", _versions.versions);
     }
