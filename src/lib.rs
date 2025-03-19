@@ -610,7 +610,7 @@ impl<'a> BitIndexer<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Token {
+pub(crate) struct Token {
     data: u64,
 }
 
@@ -648,12 +648,12 @@ impl Token {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenKind {
+pub(crate) enum TokenKind {
     Operator = 0,
     String = 1,
     // Scalar,
 }
-pub struct Tokenizer<'a> {
+pub(crate) struct Tokenizer<'a, Mask: OpMask = NoCommaOrColon> {
     scanner: JsonScanner,
     tokens: Vec<Token>,
     buf: [TypedIndex; 64],
@@ -662,9 +662,32 @@ pub struct Tokenizer<'a> {
     idx: u32,
 
     incomplete_string: bool,
+
+    _marker: std::marker::PhantomData<Mask>,
 }
 
-impl<'a> Tokenizer<'a> {
+pub trait CharsEq {
+    fn eq_mask(&self, value: u8) -> u64;
+}
+
+impl CharsEq for simd::Simd8x64<u8> {
+    fn eq_mask(&self, value: u8) -> u64 {
+        self.eq(value)
+    }
+}
+pub trait OpMask {
+    fn op_mask(b: &impl CharsEq) -> u64;
+}
+
+pub struct NoCommaOrColon;
+
+impl OpMask for NoCommaOrColon {
+    fn op_mask(b: &impl CharsEq) -> u64 {
+        b.eq_mask(b',') | b.eq_mask(b':')
+    }
+}
+
+impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
     pub fn new(input: &'a [u8]) -> Self {
         if input.len() > 0x7FFF_FFFF {
             panic!("input is too long");
@@ -676,13 +699,14 @@ impl<'a> Tokenizer<'a> {
             block_reader: BufBlockReader::new(input),
             idx: 0,
             incomplete_string: false,
+            _marker: std::marker::PhantomData,
         }
     }
 
-    fn process_json_block(&mut self, json_block: JsonBlock) {
+    fn process_json_block(&mut self, json_block: JsonBlock, dont_care: u64) {
         let mut bit_indexer = BitIndexer::new(&mut self.buf);
 
-        let ops = json_block.characters.op() & !json_block.string.in_string;
+        let ops = json_block.characters.op() & !json_block.string.in_string & !dont_care;
         let mut strings = json_block.string.quote;
 
         if self.incomplete_string {
@@ -754,7 +778,8 @@ impl<'a> Tokenizer<'a> {
             let block = simd::Simd8x64::<u8>::load(arrayref::array_ref![block, 0, 64]);
             let json_block = self.scanner.next(&block);
             self.block_reader.advance();
-            self.process_json_block(json_block);
+            let dont_care = Mask::op_mask(&block);
+            self.process_json_block(json_block, dont_care);
             self.idx += 64;
         }
 
@@ -763,14 +788,15 @@ impl<'a> Tokenizer<'a> {
         let block = simd::Simd8x64::<u8>::load(arrayref::array_ref![&remainder_buf, 0, 64]);
         let json_block = self.scanner.next(&block);
         self.block_reader.advance();
-        self.process_json_block(json_block);
+        let dont_care = Mask::op_mask(&block);
+        self.process_json_block(json_block, dont_care);
         self.idx += 64;
         self.scanner.finish()?;
         Ok(self.tokens)
     }
 }
 
-pub fn pluck_versions_from_tokens(input: &str, tokens: Vec<Token>) -> Versions<'_> {
+pub(crate) fn pluck_versions_from_tokens(input: &str, tokens: Vec<Token>) -> Versions<'_> {
     enum State<'i> {
         Start,
         InVersions,
@@ -854,7 +880,7 @@ pub struct Versions<'i> {
 }
 
 pub fn pluck_versions(input: &str) -> Versions<'_> {
-    let tokenizer = Tokenizer::new(input.as_bytes());
+    let tokenizer = Tokenizer::<NoCommaOrColon>::new(input.as_bytes());
     let tokens = tokenizer.tokenize().unwrap();
     pluck_versions_from_tokens(input, tokens)
 }
@@ -937,8 +963,18 @@ mod tests {
         annotated
     }
 
+    struct KeepAll;
+
+    impl OpMask for KeepAll {
+        fn op_mask(_b: &impl CharsEq) -> u64 {
+            0
+        }
+    }
+
     fn assert_tokens_eq(input: &str, expected: Vec<Token>) {
-        let tokens = Tokenizer::new(input.as_bytes()).tokenize().unwrap();
+        let tokens = Tokenizer::<KeepAll>::new(input.as_bytes())
+            .tokenize()
+            .unwrap();
         if tokens != expected {
             eprintln!("got\n-----\n{}", annotated(input, &tokens));
             eprintln!("expected\n-----\n{}", annotated(input, &expected));
