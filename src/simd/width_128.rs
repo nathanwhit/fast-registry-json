@@ -245,7 +245,7 @@ impl WrapsBaseU8 for Simd8<bool> {
 impl From<u8x16> for Simd8<bool> {
     #[inline(always)]
     fn from(value: u8x16) -> Self {
-        Self::from_base(value.into())
+        Self::from_base(value)
     }
 }
 

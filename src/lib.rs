@@ -1,5 +1,3 @@
-use simd::Simd8x64;
-
 pub mod simd;
 
 // lifted from `wide`
@@ -93,7 +91,7 @@ struct EscapedAndEscape {
     /**
      * Mask of escaped characters.
      *
-     * ```ignore
+     * ```notrust
      * \n \\n \\\n \\\\n \
      * 0100100010100101000
      *  n  \   \ n  \ \
@@ -103,7 +101,7 @@ struct EscapedAndEscape {
     // /**
     //  * Mask of escape characters.
     //  *
-    //  * ```ignore
+    //  * ```notrust
     //  * \n \\n \\\n \\\\n \
     //  * 1001000101001010001
     //  * \  \   \ \  \ \   \
@@ -344,10 +342,11 @@ pub struct JsonCharacterBlock {
 mod classify {
     use super::*;
 
-    #[cfg(any(target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     pub fn classify(input: &simd::Simd8x64<u8>) -> JsonCharacterBlock {
         use simd::width_128::Simd8;
+        use simd::width_128::Simd8x64;
         use simd::width_128::make_u8x16;
         let table1 = make_u8x16(16, 0, 0, 0, 0, 0, 0, 0, 0, 8, 12, 1, 2, 9, 0, 0).into();
         let table2 = make_u8x16(8, 0, 18, 4, 0, 1, 0, 1, 0, 0, 0, 3, 2, 1, 0, 0).into();
@@ -382,16 +381,17 @@ mod classify {
         JsonCharacterBlock { whitespace, op }
     }
 
-    #[cfg(any(target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     pub fn classify(input: &simd::width_128::Simd8x64<u8>) -> JsonCharacterBlock {
-        use simd::width_128::{Simd8x64, U8x16Ext, make_u8x16};
+        use simd::width_128::{Simd8x64, make_u8x16};
+
+        use crate::simd::width_128::Simd8;
         // These lookups rely on the fact that anything < 127 will match the lower 4 bits, which is why
         // we can't use the generic lookup_16.
-        let whitespace_table = simd::width_128::make_u8x16(
+        let whitespace_table = make_u8x16(
             b' ', 100, 100, 100, 17, 100, 113, 2, 100, b'\t', b'\n', 112, 100, b'\r', 100, 100,
         );
-        let whitespace_table = whitespace_table.to_underlying();
         // The 6 operators (:,[]{}) have these values:
         //
         // , 2C
@@ -411,88 +411,45 @@ mod classify {
         // NOTE: Due to the | 0x20, this ALSO treats <FF> and <SUB> (control characters 0C and 1A) like ,
         // and :. This gets caught in stage 2, which checks the actual character to ensure the right
         // operators are in the right places.
-        let op_table = simd::width_128::make_u8x16(
+        let op_table = make_u8x16(
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b':', b'{', // : = 3A, [ = 5B, { = 7B
             b',', b'}', 0, 0, // , = 2C, ] = 5D, } = 7D
         );
-        let op_table = op_table.to_underlying();
 
         #[inline(always)]
-        fn shuffle(table: __m128i, input: u8x16) -> u8x16 {
-            unsafe { std::arch::x86_64::_mm_shuffle_epi8(table, bytemuck::must_cast(input)) }
+        fn shuffle(table: wide::u8x16, input: Simd8<u8>) -> Simd8<u8> {
+            unsafe {
+                std::arch::x86_64::_mm_shuffle_epi8(
+                    bytemuck::must_cast(table),
+                    bytemuck::must_cast(input.base),
+                )
+            }
+            .into()
         }
 
         // We compute whitespace and op separately. If the code later only use one or the
         // other, given the fact that all functions are aggressively inlined, we can
         // hope that useless computations will be omitted. This is namely case when
         // minifying (we only need whitespace).
-        let whitespace = input.cmp_eq_mask(&simd::width_128::Simd8x64::from_chunks([
-            unsafe {
-                std::arch::x86_64::_mm_shuffle_epi8(
-                    whitespace_table,
-                    bytemuck::must_cast(input.chunks[0].base),
-                )
-            }
-            .into(),
-            unsafe {
-                std::arch::x86_64::_mm_shuffle_epi8(
-                    whitespace_table,
-                    bytemuck::must_cast(input.chunks[1].base),
-                )
-            }
-            .into(),
-            unsafe {
-                std::arch::x86_64::_mm_shuffle_epi8(
-                    whitespace_table,
-                    bytemuck::must_cast(input.chunks[2].base),
-                )
-            }
-            .into(),
-            unsafe {
-                std::arch::x86_64::_mm_shuffle_epi8(
-                    whitespace_table,
-                    bytemuck::must_cast(input.chunks[3].base),
-                )
-            }
-            .into(),
+        let whitespace = input.cmp_eq_mask(&Simd8x64::from_chunks([
+            shuffle(whitespace_table, input.chunks[0]),
+            shuffle(whitespace_table, input.chunks[1]),
+            shuffle(whitespace_table, input.chunks[2]),
+            shuffle(whitespace_table, input.chunks[3]),
         ]));
 
-        let curlified = simd::width_128::Simd8x64::from_chunks([
+        let curlified = Simd8x64::from_chunks([
             input.chunks[0] | 0x20.into(),
             input.chunks[1] | 0x20.into(),
             input.chunks[2] | 0x20.into(),
             input.chunks[3] | 0x20.into(),
         ]);
 
-        let op = curlified.cmp_eq_mask(&simd::width_128::Simd8x64::from_chunks([
-            unsafe {
-                std::arch::x86_64::_mm_shuffle_epi8(
-                    op_table,
-                    bytemuck::must_cast(curlified.chunks[0].base),
-                )
-            }
-            .into(),
-            unsafe {
-                std::arch::x86_64::_mm_shuffle_epi8(
-                    op_table,
-                    bytemuck::must_cast(curlified.chunks[1].base),
-                )
-            }
-            .into(),
-            unsafe {
-                std::arch::x86_64::_mm_shuffle_epi8(
-                    op_table,
-                    bytemuck::must_cast(curlified.chunks[2].base),
-                )
-            }
-            .into(),
-            unsafe {
-                std::arch::x86_64::_mm_shuffle_epi8(
-                    op_table,
-                    bytemuck::must_cast(curlified.chunks[3].base),
-                )
-            }
-            .into(),
+        let op = curlified.cmp_eq_mask(&Simd8x64::from_chunks([
+            shuffle(op_table, curlified.chunks[0]),
+            shuffle(op_table, curlified.chunks[1]),
+            shuffle(op_table, curlified.chunks[2]),
+            shuffle(op_table, curlified.chunks[3]),
         ]));
 
         JsonCharacterBlock { whitespace, op }
@@ -505,7 +462,7 @@ impl JsonCharacterBlock {
     pub fn classify(input: &simd::Simd8x64<u8>) -> Self {
         pick! {
             if #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))] {
-                return classify::classify(input);
+                classify::classify(input)
             } else {
                 unimplemented!()
             }
