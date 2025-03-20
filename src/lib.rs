@@ -1013,6 +1013,9 @@ pub(crate) fn pluck_versions_from_tokens(
                 } else if v == b'}' {
                     if object_depth == 2 && matches!(state, State::InVersions | State::InDistTags) {
                         state = State::Start;
+                        if dist_tags.len() > 0 && versions.len() > 0 {
+                            break;
+                        }
                     } else if object_depth == 3 && matches!(state, State::WantVersion) {
                         let last = version_ranges.len() - 1;
                         version_ranges[last].1 = token.end();
