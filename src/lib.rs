@@ -791,11 +791,8 @@ pub(crate) enum TokenKind {
 pub(crate) struct Tokenizer<'a, Mask: OpMask = NoCommaOrColon> {
     scanner: JsonScanner,
     tokens: Vec<Token>,
-    // buf: [TypedIndex; 64],
     block_reader: BufBlockReader<'a, 64>,
     idx: u32,
-
-    incomplete_string: bool,
 
     bit_indexer: BitIndexer,
 
@@ -836,7 +833,6 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
             // buf: [TypedIndex::ZERO; 64],
             block_reader: BufBlockReader::new(input),
             idx: 0,
-            incomplete_string: false,
             _marker: std::marker::PhantomData,
             bit_indexer: BitIndexer::new(),
         }
@@ -846,79 +842,9 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
     fn process_json_block(&mut self, json_block: JsonBlock, dont_care: u64) {
         let ops = json_block.characters.op() & !json_block.string.in_string & !dont_care;
         let strings = json_block.string.quote;
-
-        // if self.incomplete_string {
-        //     let pos = 64 - json_block.string.quote.trailing_zeros();
-        //     if pos == 0 {
-        //         return;
-        //     }
-        //     let last = self.tokens.len() - 1;
-        //     self.tokens[last].set_end(self.idx + (64 - pos));
-        //     let mask = if pos <= 1 {
-        //         0
-        //     } else {
-        //         (!0u64) << ((64 - pos) + 1)
-        //     };
-        //     self.incomplete_string = false;
-        //     strings &= mask;
-        // }
-        let wrote = self
+        let _wrote = self
             .bit_indexer
             .write(self.idx, ops | strings, strings, &mut self.tokens);
-        // self.tokens.reserve(wrote);
-        // let mut found_end = false;
-        // let mut did_write_string = false;
-        // let mut i = 0;
-        // let mut t = 0;
-        // let tokens_rest = self.tokens.spare_capacity_mut();
-        // while i < wrote {
-        //     let index = self.buf[i];
-        //     let start = index.index();
-        //     match index.kind() {
-        //         TypedIndexKind::Operator => {
-        //             let end = start + 1;
-        //             unsafe {
-        //                 std::ptr::write(
-        //                     tokens_rest.as_mut_ptr().add(t).cast(),
-        //                     Token::new(start, end, TokenKind::Operator),
-        //                 );
-        //             }
-        //             t += 1;
-        //             i += 1;
-        //         }
-        //         TypedIndexKind::Quote => {
-        //             did_write_string = true;
-        //             found_end = false;
-        //             // find the end of the string
-        //             let mut end = start;
-        //             i += 1;
-        //             if i < wrote && self.buf[i].kind() == TypedIndexKind::Quote {
-        //                 end = self.buf[i].index();
-        //                 i += 1;
-        //                 found_end = true;
-        //             }
-        //             unsafe {
-        //                 std::ptr::write(
-        //                     tokens_rest.as_mut_ptr().add(t).cast(),
-        //                     Token::new(
-        //                         start + 1,
-        //                         if end == start { start + 1 } else { end },
-        //                         TokenKind::String,
-        //                     ),
-        //                 );
-        //             }
-        //             t += 1;
-        //         }
-        //     }
-        // }
-        // let orig_len = self.tokens.len();
-        // unsafe {
-        //     self.tokens.set_len(orig_len + t);
-        // }
-
-        // if did_write_string && !found_end {
-        //     self.incomplete_string = true;
-        // }
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Token>, Error> {
