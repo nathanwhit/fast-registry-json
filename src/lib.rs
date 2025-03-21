@@ -37,6 +37,8 @@ macro_rules! pick {
     };
 }
 
+use std::mem::MaybeUninit;
+
 pub(crate) use pick;
 
 pub struct BufBlockReader<'a, const STEP_SIZE: usize> {
@@ -626,9 +628,9 @@ impl JsonScanner {
 //     result
 // }
 
-pub struct BitIndexer<'a> {
-    tail: &'a mut [TypedIndex],
+pub(crate) struct BitIndexer {
     idx: usize,
+    last_was_quote: bool,
 }
 
 #[inline(always)]
@@ -636,71 +638,59 @@ fn zero_leading_bit(rev_bits: u64, leading_zeroes: u32) -> u64 {
     rev_bits ^ (0x8000000000000000u64.wrapping_shr(leading_zeroes))
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct TypedIndex {
-    data: u32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TypedIndexKind {
-    Operator = 0,
-    Quote = 1,
-}
-
-impl TypedIndex {
-    const ZERO: Self = Self { data: 0 };
-
+impl BitIndexer {
     #[inline(always)]
-    fn new(index: u32, kind: TypedIndexKind) -> Self {
+    pub fn new() -> Self {
         Self {
-            data: (index & 0x7FFFFFFF) | ((kind as u32) << 31),
+            idx: 0,
+            last_was_quote: false,
         }
     }
 
     #[inline(always)]
-    fn index(&self) -> u32 {
-        self.data & 0x7FFFFFFF
-    }
-
-    #[inline(always)]
-    fn kind(&self) -> TypedIndexKind {
-        match self.data >> 31 {
-            0 => TypedIndexKind::Operator,
-            1 => TypedIndexKind::Quote,
-            _ => unsafe { std::hint::unreachable_unchecked() },
+    pub fn write_index(
+        &mut self,
+        index: u32,
+        rev_bits: &mut u64,
+        quotes: u64,
+        tail: &mut Vec<Token>,
+    ) {
+        if *rev_bits == 0 {
+            return;
         }
-    }
-}
-
-impl<'a> BitIndexer<'a> {
-    #[inline(always)]
-    pub fn new(tail: &'a mut [TypedIndex]) -> Self {
-        Self { tail, idx: 0 }
-    }
-
-    #[inline(always)]
-    pub fn write_index(&mut self, index: u32, rev_bits: &mut u64, i: usize, quotes: u64) {
         let lz = rev_bits.leading_zeros();
         let is_quote = quotes & (1u64.wrapping_shl(lz)) != 0;
-        unsafe {
-            *self.tail.get_unchecked_mut(self.idx + i) = TypedIndex::new(
-                index + lz,
-                if is_quote {
-                    TypedIndexKind::Quote
-                } else {
-                    TypedIndexKind::Operator
-                },
-            );
+        if is_quote {
+            if self.last_was_quote {
+                tail.last_mut().unwrap().set_end(index + lz);
+                self.last_was_quote = false;
+            } else {
+                tail.push(Token::new(
+                    index + lz + 1,
+                    index + lz + 1,
+                    TokenKind::String,
+                ));
+                self.last_was_quote = true;
+            }
+        } else {
+            tail.push(Token::new(index + lz, index + lz + 1, TokenKind::Operator));
+            self.last_was_quote = is_quote;
         }
         *rev_bits = zero_leading_bit(*rev_bits, lz);
     }
 
     #[inline(always)]
-    pub fn write_indexes(&mut self, index: u32, rev_bits: &mut u64, start: usize, quotes: u64) {
-        self.write_index(index, rev_bits, start, quotes);
-        self.write_index(index, rev_bits, start + 1, quotes);
-        self.write_index(index, rev_bits, start + 2, quotes);
-        self.write_index(index, rev_bits, start + 3, quotes);
+    pub fn write_indexes(
+        &mut self,
+        index: u32,
+        rev_bits: &mut u64,
+        quotes: u64,
+        tail: &mut Vec<Token>,
+    ) {
+        self.write_index(index, rev_bits, quotes, tail);
+        self.write_index(index, rev_bits, quotes, tail);
+        self.write_index(index, rev_bits, quotes, tail);
+        self.write_index(index, rev_bits, quotes, tail);
     }
 
     #[inline(always)]
@@ -712,27 +702,28 @@ impl<'a> BitIndexer<'a> {
         start: usize,
         end: usize,
         quotes: u64,
+        tail: &mut Vec<Token>,
     ) {
-        self.write_indexes(index, rev_bits, start, quotes);
+        self.write_indexes(index, rev_bits, quotes, tail);
         if start + 4 < end && start + 4 < cnt {
-            self.write_indexes(index, rev_bits, start + 4, quotes);
+            self.write_indexes(index, rev_bits, quotes, tail);
         }
         if start + 8 < end && start + 8 < cnt {
-            self.write_indexes(index, rev_bits, start + 8, quotes);
+            self.write_indexes(index, rev_bits, quotes, tail);
         }
         if start + 12 < end && start + 12 < cnt {
-            self.write_indexes(index, rev_bits, start + 12, quotes);
+            self.write_indexes(index, rev_bits, quotes, tail);
         }
         if start + 16 < end && start + 16 < cnt {
-            self.write_indexes(index, rev_bits, start + 16, quotes);
+            self.write_indexes(index, rev_bits, quotes, tail);
         }
         if start + 20 < end && start + 20 < cnt {
-            self.write_indexes(index, rev_bits, start + 20, quotes);
+            self.write_indexes(index, rev_bits, quotes, tail);
         }
     }
 
     #[inline(always)]
-    pub fn write(&mut self, index: u32, bits: u64, quotes: u64) -> usize {
+    pub fn write(&mut self, index: u32, bits: u64, quotes: u64, tail: &mut Vec<Token>) -> usize {
         if bits == 0 {
             return 0;
         }
@@ -740,11 +731,11 @@ impl<'a> BitIndexer<'a> {
         let cnt = bits.count_ones();
         let mut rev_bits = bits.reverse_bits();
 
-        self.write_indexes_stepped(index, &mut rev_bits, cnt as usize, 0, 24, quotes);
+        self.write_indexes_stepped(index, &mut rev_bits, cnt as usize, 0, 24, quotes, tail);
 
         if cnt > 24 {
-            for i in 24..cnt {
-                self.write_index(index, &mut rev_bits, i as usize, quotes);
+            for _ in 24..cnt {
+                self.write_index(index, &mut rev_bits, quotes, tail);
             }
         }
 
@@ -800,12 +791,13 @@ pub(crate) enum TokenKind {
 pub(crate) struct Tokenizer<'a, Mask: OpMask = NoCommaOrColon> {
     scanner: JsonScanner,
     tokens: Vec<Token>,
-    buf: [TypedIndex; 64],
-
+    // buf: [TypedIndex; 64],
     block_reader: BufBlockReader<'a, 64>,
     idx: u32,
 
     incomplete_string: bool,
+
+    bit_indexer: BitIndexer,
 
     _marker: std::marker::PhantomData<Mask>,
 }
@@ -841,92 +833,92 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
         Self {
             scanner: JsonScanner::new(),
             tokens: Vec::with_capacity(input.len() / 4),
-            buf: [TypedIndex::ZERO; 64],
+            // buf: [TypedIndex::ZERO; 64],
             block_reader: BufBlockReader::new(input),
             idx: 0,
             incomplete_string: false,
             _marker: std::marker::PhantomData,
+            bit_indexer: BitIndexer::new(),
         }
     }
 
     #[inline(always)]
     fn process_json_block(&mut self, json_block: JsonBlock, dont_care: u64) {
-        let mut bit_indexer = BitIndexer::new(&mut self.buf);
-
         let ops = json_block.characters.op() & !json_block.string.in_string & !dont_care;
-        let mut strings = json_block.string.quote;
+        let strings = json_block.string.quote;
 
-        if self.incomplete_string {
-            let pos = 64 - json_block.string.quote.trailing_zeros();
-            if pos == 0 {
-                return;
-            }
-            let last = self.tokens.len() - 1;
-            self.tokens[last].set_end(self.idx + (64 - pos));
-            let mask = if pos <= 1 {
-                0
-            } else {
-                (!0u64) << ((64 - pos) + 1)
-            };
-            self.incomplete_string = false;
-            strings &= mask;
-        }
-        let wrote = bit_indexer.write(self.idx, ops | strings, strings);
-        self.tokens.reserve(wrote);
-        let mut found_end = false;
-        let mut did_write_string = false;
-        let mut i = 0;
-        let mut t = 0;
-        let tokens_rest = self.tokens.spare_capacity_mut();
-        while i < wrote {
-            let index = self.buf[i];
-            match index.kind() {
-                TypedIndexKind::Operator => {
-                    let start = index.index();
-                    let end = start + 1;
-                    unsafe {
-                        std::ptr::write(
-                            tokens_rest.as_mut_ptr().add(t).cast(),
-                            Token::new(start, end, TokenKind::Operator),
-                        );
-                    }
-                    t += 1;
-                    i += 1;
-                }
-                TypedIndexKind::Quote => {
-                    did_write_string = true;
-                    let start = index.index();
-                    found_end = false;
-                    // find the end of the string
-                    let mut end = start;
-                    i += 1;
-                    if i < wrote && self.buf[i].kind() == TypedIndexKind::Quote {
-                        end = self.buf[i].index();
-                        i += 1;
-                        found_end = true;
-                    }
-                    unsafe {
-                        std::ptr::write(
-                            tokens_rest.as_mut_ptr().add(t).cast(),
-                            Token::new(
-                                start + 1,
-                                if end == start { start + 1 } else { end },
-                                TokenKind::String,
-                            ),
-                        );
-                    }
-                    t += 1;
-                }
-            }
-        }
-        let orig_len = self.tokens.len();
-        unsafe {
-            self.tokens.set_len(orig_len + t);
-        }
+        // if self.incomplete_string {
+        //     let pos = 64 - json_block.string.quote.trailing_zeros();
+        //     if pos == 0 {
+        //         return;
+        //     }
+        //     let last = self.tokens.len() - 1;
+        //     self.tokens[last].set_end(self.idx + (64 - pos));
+        //     let mask = if pos <= 1 {
+        //         0
+        //     } else {
+        //         (!0u64) << ((64 - pos) + 1)
+        //     };
+        //     self.incomplete_string = false;
+        //     strings &= mask;
+        // }
+        let wrote = self
+            .bit_indexer
+            .write(self.idx, ops | strings, strings, &mut self.tokens);
+        // self.tokens.reserve(wrote);
+        // let mut found_end = false;
+        // let mut did_write_string = false;
+        // let mut i = 0;
+        // let mut t = 0;
+        // let tokens_rest = self.tokens.spare_capacity_mut();
+        // while i < wrote {
+        //     let index = self.buf[i];
+        //     let start = index.index();
+        //     match index.kind() {
+        //         TypedIndexKind::Operator => {
+        //             let end = start + 1;
+        //             unsafe {
+        //                 std::ptr::write(
+        //                     tokens_rest.as_mut_ptr().add(t).cast(),
+        //                     Token::new(start, end, TokenKind::Operator),
+        //                 );
+        //             }
+        //             t += 1;
+        //             i += 1;
+        //         }
+        //         TypedIndexKind::Quote => {
+        //             did_write_string = true;
+        //             found_end = false;
+        //             // find the end of the string
+        //             let mut end = start;
+        //             i += 1;
+        //             if i < wrote && self.buf[i].kind() == TypedIndexKind::Quote {
+        //                 end = self.buf[i].index();
+        //                 i += 1;
+        //                 found_end = true;
+        //             }
+        //             unsafe {
+        //                 std::ptr::write(
+        //                     tokens_rest.as_mut_ptr().add(t).cast(),
+        //                     Token::new(
+        //                         start + 1,
+        //                         if end == start { start + 1 } else { end },
+        //                         TokenKind::String,
+        //                     ),
+        //                 );
+        //             }
+        //             t += 1;
+        //         }
+        //     }
+        // }
+        // let orig_len = self.tokens.len();
+        // unsafe {
+        //     self.tokens.set_len(orig_len + t);
+        // }
 
-        if did_write_string && !found_end {
-            self.incomplete_string = true;
-        }
+        // if did_write_string && !found_end {
+        //     self.incomplete_string = true;
+        // }
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Token>, Error> {
@@ -1004,7 +996,11 @@ pub(crate) fn pluck_versions_from_tokens(
             }
             TokenKind::Operator => {
                 let v = input_bytes[token.start() as usize];
-                debug_assert!(v == b'{' || v == b'}' || v == b'[' || v == b']');
+                debug_assert!(
+                    v == b'{' || v == b'}' || v == b'[' || v == b']',
+                    "invalid operator: {}",
+                    v as char
+                );
                 if v == b'{' {
                     object_depth += 1;
                     if object_depth == 3 && matches!(state, State::WantVersion) {
@@ -1124,7 +1120,11 @@ mod tests {
             annotated.push_str(&format!("{} {} {:?}\n", tok.start(), tok.end(), tok.kind()));
             annotated.push('"');
             if tok.start() <= tok.end() {
-                annotated.push_str(&input[tok.start() as usize..tok.end() as usize]);
+                if tok.start() < input.len() as u32 {
+                    annotated.push_str(&input[tok.start() as usize..tok.end() as usize]);
+                } else {
+                    annotated.push_str("badbadbad out of bounds");
+                }
             } else {
                 annotated.push_str("badbadbad");
             }

@@ -13,7 +13,8 @@ fn main() {
     // let input = r#"{"versions":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{},"bcdefghijkab":"asdf"}}"#;
 
     // println!("{}", &input[122688 - 32..122688 + 64]);
-    for _ in 0..1 {
+    let runs = if cfg!(target_os = "linux") { 1 } else { 10 };
+    for _ in 0..runs {
         let _versions = std::hint::black_box(fast_registry_json::pluck_versions(&input));
         // println!("versions: {:?}", _versions.versions);
     }
