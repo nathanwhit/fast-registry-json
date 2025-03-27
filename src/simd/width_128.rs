@@ -1,3 +1,4 @@
+// All adapted from https://github.com/simdjson/simdjson
 use std::{
     marker::PhantomData,
     ops::{BitAnd, BitOr, BitXor, Not},

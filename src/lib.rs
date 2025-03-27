@@ -37,8 +37,6 @@ macro_rules! pick {
     };
 }
 
-use std::mem::MaybeUninit;
-
 pub(crate) use pick;
 
 pub struct BufBlockReader<'a, const STEP_SIZE: usize> {
@@ -773,7 +771,7 @@ impl Token {
         match self.data >> 63 {
             0 => TokenKind::Operator,
             1 => TokenKind::String,
-            _ => unsafe { std::hint::unreachable_unchecked() },
+            _ => unreachable!(),
         }
     }
 
