@@ -1,3 +1,5 @@
+// JSON scanning adapted from the "stage 1" of https://github.com/simdjson/simdjson, though it diverges
+// to optimize for this specific use case.
 pub mod simd;
 
 // lifted from `wide`
@@ -344,6 +346,7 @@ mod classify {
 
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
+    // https://github.com/simdjson/simdjson/blob/2887a17bab8ccf8970d3adcf28718a1071e8b836/src/arm64.cpp#L40
     pub fn classify(input: &simd::Simd8x64<u8>) -> JsonCharacterBlock {
         use simd::width_128::Simd8;
         use simd::width_128::Simd8x64;
@@ -383,6 +386,7 @@ mod classify {
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
+    // https://github.com/simdjson/simdjson/blob/2887a17bab8ccf8970d3adcf28718a1071e8b836/src/icelake.cpp#L48
     pub fn classify(input: &simd::width_128::Simd8x64<u8>) -> JsonCharacterBlock {
         use simd::width_128::{Simd8x64, make_u8x16};
 

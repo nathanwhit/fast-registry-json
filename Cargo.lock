@@ -347,9 +347,9 @@ dependencies = [
  "deno_npm",
  "deno_semver",
  "divan",
+ "paste",
  "pretty_assertions",
  "rustc-hash",
- "safe_arch",
  "serde",
  "serde_json",
  "tango-bench",
@@ -750,6 +750,12 @@ name = "once_cell"
 version = "1.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d75b0bedcc4fe52caa0e03d9f1151a323e4aa5e2d78ba3580400cd3c9e2bc4bc"
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "percent-encoding"
