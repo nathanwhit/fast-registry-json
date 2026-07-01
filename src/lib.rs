@@ -262,6 +262,7 @@ impl JsonStringBlock {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
+    InputTooLong,
     UnclosedString,
     UnmatchedBrace(usize),
 }
@@ -341,13 +342,49 @@ pub struct JsonCharacterBlock {
     op: u64,
 }
 
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+type CharacterClassifier = fn(&simd::Simd8x64<u8>) -> JsonCharacterBlock;
+
 mod classify {
     use super::*;
 
-    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn classify_by_comparison(input: &simd::Simd8x64<u8>) -> JsonCharacterBlock {
+        let whitespace = input.eq(b' ') | input.eq(b'\t') | input.eq(b'\n') | input.eq(b'\r');
+        let op = input.eq(b',')
+            | input.eq(b':')
+            | input.eq(b'[')
+            | input.eq(b'{')
+            | input.eq(b']')
+            | input.eq(b'}');
+
+        JsonCharacterBlock { whitespace, op }
+    }
+
+    #[allow(dead_code)]
+    pub fn classify_scalar(input: &simd::Simd8x64<u8>) -> JsonCharacterBlock {
+        let mut buf = [0; 64];
+        input.store(&mut buf);
+
+        let mut whitespace = 0;
+        let mut op = 0;
+        for (i, b) in buf.into_iter().enumerate() {
+            let bit = 1u64 << i;
+            match b {
+                b' ' | b'\t' | b'\n' | b'\r' => whitespace |= bit,
+                b',' | b':' | b'[' | b'{' | b']' | b'}' => op |= bit,
+                _ => {}
+            }
+        }
+
+        JsonCharacterBlock { whitespace, op }
+    }
+
+    #[cfg(all(feature = "simd", target_arch = "aarch64", target_feature = "neon"))]
     #[inline(always)]
     // https://github.com/simdjson/simdjson/blob/2887a17bab8ccf8970d3adcf28718a1071e8b836/src/arm64.cpp#L40
-    pub fn classify(input: &simd::Simd8x64<u8>) -> JsonCharacterBlock {
+    pub fn classify_aarch64_neon(input: &simd::Simd8x64<u8>) -> JsonCharacterBlock {
         use simd::width_128::Simd8;
         use simd::width_128::Simd8x64;
         use simd::width_128::make_u8x16;
@@ -384,10 +421,10 @@ mod classify {
         JsonCharacterBlock { whitespace, op }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[target_feature(enable = "ssse3")]
     // https://github.com/simdjson/simdjson/blob/2887a17bab8ccf8970d3adcf28718a1071e8b836/src/icelake.cpp#L48
-    pub fn classify(input: &simd::width_128::Simd8x64<u8>) -> JsonCharacterBlock {
+    pub unsafe fn classify_x86_ssse3(input: &simd::width_128::Simd8x64<u8>) -> JsonCharacterBlock {
         use simd::width_128::{Simd8x64, make_u8x16};
 
         use crate::simd::width_128::Simd8;
@@ -422,6 +459,9 @@ mod classify {
 
         #[inline(always)]
         fn shuffle(table: wide::u8x16, input: Simd8<u8>) -> Simd8<u8> {
+            // SAFETY: `classify_x86_ssse3` is compiled with and must be called
+            // only when SSSE3 is available. Both operands are 128-bit vector
+            // values with the expected layout.
             unsafe {
                 std::arch::x86_64::_mm_shuffle_epi8(
                     bytemuck::must_cast(table),
@@ -458,18 +498,45 @@ mod classify {
 
         JsonCharacterBlock { whitespace, op }
     }
+
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn classify_x86_ssse3_dispatch(input: &simd::width_128::Simd8x64<u8>) -> JsonCharacterBlock {
+        // SAFETY: this function is only selected by `runtime_classifier` after
+        // checking `is_x86_feature_detected!("ssse3")`.
+        unsafe { classify_x86_ssse3(input) }
+    }
+
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    pub fn runtime_classifier() -> CharacterClassifier {
+        static CLASSIFIER: std::sync::OnceLock<CharacterClassifier> = std::sync::OnceLock::new();
+        *CLASSIFIER.get_or_init(|| {
+            if std::is_x86_feature_detected!("ssse3") {
+                classify_x86_ssse3_dispatch
+            } else {
+                classify_by_comparison
+            }
+        })
+    }
 }
 
 impl JsonCharacterBlock {
     #[inline(always)]
     /// Classify a block of JSON text
     pub fn classify(input: &simd::Simd8x64<u8>) -> Self {
-        pick! {
-            if #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))] {
-                classify::classify(input)
-            } else {
-                unimplemented!()
-            }
+        #[cfg(all(feature = "simd", target_arch = "aarch64", target_feature = "neon"))]
+        {
+            classify::classify_aarch64_neon(input)
+        }
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        {
+            (classify::runtime_classifier())(input)
+        }
+        #[cfg(not(any(
+            all(feature = "simd", target_arch = "aarch64", target_feature = "neon"),
+            all(feature = "simd", target_arch = "x86_64")
+        )))]
+        {
+            classify::classify_by_comparison(input)
         }
     }
 
@@ -580,6 +647,8 @@ pub(crate) struct JsonScanner {
     // /// (anything except whitespace or a structural character/'operator').
     // prev_scalar: u64,
     string_scanner: JsonStringScanner,
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    character_classifier: CharacterClassifier,
 }
 
 impl JsonScanner {
@@ -587,6 +656,8 @@ impl JsonScanner {
         Self {
             // prev_scalar: 0,
             string_scanner: JsonStringScanner::new(),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            character_classifier: classify::runtime_classifier(),
         }
     }
 
@@ -594,6 +665,9 @@ impl JsonScanner {
     pub fn next(&mut self, input: &simd::Simd8x64<u8>) -> JsonBlock {
         let strings = self.string_scanner.next(input);
         // Identifies the white-space and the structural characters
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        let characters = (self.character_classifier)(input);
+        #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
         let characters = JsonCharacterBlock::classify(input);
 
         // The term "scalar" refers to anything except structural characters and white space
@@ -696,6 +770,7 @@ impl BitIndexer {
     }
 
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     pub fn write_indexes_stepped(
         &mut self,
         index: u32,
@@ -782,6 +857,16 @@ impl Token {
     pub fn value<'a>(&self, input: &'a [u8]) -> &'a [u8] {
         &input[self.start() as usize..self.end() as usize]
     }
+
+    pub fn string_value<'a>(&self, input: &'a str) -> &'a str {
+        debug_assert_eq!(self.kind(), TokenKind::String);
+        let bytes = self.value(input.as_bytes());
+        // SAFETY: `input` is valid UTF-8, and string token boundaries are
+        // quote-delimited byte positions from that same string. Quotes are ASCII
+        // single-byte delimiters, so slicing just inside them preserves UTF-8
+        // character boundaries.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -825,11 +910,11 @@ impl OpMask for NoCommaOrColon {
 }
 
 impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
-    pub fn new(input: &'a [u8]) -> Self {
+    pub fn new(input: &'a [u8]) -> Result<Self, Error> {
         if input.len() > 0x7FFF_FFFF {
-            panic!("input is too long");
+            return Err(Error::InputTooLong);
         }
-        Self {
+        Ok(Self {
             scanner: JsonScanner::new(),
             tokens: Vec::with_capacity(input.len() / 4),
             // buf: [TypedIndex::ZERO; 64],
@@ -837,7 +922,7 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
             idx: 0,
             _marker: std::marker::PhantomData,
             bit_indexer: BitIndexer::new(),
-        }
+        })
     }
 
     #[inline(always)]
@@ -891,6 +976,7 @@ pub(crate) fn pluck_versions_from_tokens(
 
     let mut dist_tags = rustc_hash::FxHashMap::<&str, &str>::default();
     let mut object_depth = 0;
+    let mut finished_early = false;
     let input_bytes = input.as_bytes();
     for token in tokens {
         match token.kind() {
@@ -903,32 +989,27 @@ pub(crate) fn pluck_versions_from_tokens(
                         state = State::InDistTags;
                     }
                 } else if object_depth == 2 && matches!(state, State::InVersions) {
-                    let v: &[u8] = token.value(input_bytes);
-                    versions.push(unsafe { std::str::from_utf8_unchecked(v) });
+                    versions.push(token.string_value(input));
                     state = State::WantVersion;
                 } else if object_depth == 2 && matches!(state, State::InDistTags) {
-                    let v: &[u8] = token.value(input_bytes);
-                    let key = unsafe { std::str::from_utf8_unchecked(v) };
+                    let key = token.string_value(input);
                     dist_tags.insert(key, "");
                     state = State::WantDistTagValue(key);
-                } else if object_depth == 2 {
-                    if let State::WantDistTagValue(key) = state {
-                        let dist_tag = dist_tags.get_mut(key);
-                        if let Some(dist_tag) = dist_tag {
-                            let v: &[u8] = token.value(input_bytes);
-                            *dist_tag = unsafe { std::str::from_utf8_unchecked(v) };
-                        }
-                        state = State::InDistTags;
+                } else if object_depth == 2
+                    && let State::WantDistTagValue(key) = state
+                {
+                    let dist_tag = dist_tags.get_mut(key);
+                    if let Some(dist_tag) = dist_tag {
+                        *dist_tag = token.string_value(input);
                     }
+                    state = State::InDistTags;
                 }
             }
             TokenKind::Operator => {
                 let v = input_bytes[token.start() as usize];
-                debug_assert!(
-                    v == b'{' || v == b'}' || v == b'[' || v == b']',
-                    "invalid operator: {}",
-                    v as char
-                );
+                if !matches!(v, b'{' | b'}' | b'[' | b']') {
+                    continue;
+                }
                 if v == b'{' {
                     object_depth += 1;
                     if object_depth == 3 && matches!(state, State::WantVersion) {
@@ -937,12 +1018,14 @@ pub(crate) fn pluck_versions_from_tokens(
                 } else if v == b'}' {
                     if object_depth == 2 && matches!(state, State::InVersions | State::InDistTags) {
                         state = State::Start;
-                        if dist_tags.len() > 0 && versions.len() > 0 {
+                        if !dist_tags.is_empty() && !versions.is_empty() {
+                            finished_early = true;
                             break;
                         }
                     } else if object_depth == 3 && matches!(state, State::WantVersion) {
-                        let last = version_ranges.len() - 1;
-                        version_ranges[last].1 = token.end();
+                        if let Some(last) = version_ranges.last_mut() {
+                            last.1 = token.end();
+                        }
                         state = State::InVersions;
                     }
                     if object_depth == 0 {
@@ -960,6 +1043,9 @@ pub(crate) fn pluck_versions_from_tokens(
             }
         }
     }
+    if !finished_early && object_depth != 0 {
+        return Err(Error::UnmatchedBrace(input.len()));
+    }
     Ok(Versions {
         versions,
         version_ranges,
@@ -975,9 +1061,258 @@ pub struct Versions<'i> {
 }
 
 pub fn pluck_versions(input: &str) -> Result<Versions<'_>, Error> {
-    let tokenizer = Tokenizer::<NoCommaOrColon>::new(input.as_bytes());
+    let tokenizer = Tokenizer::<NoCommaOrColon>::new(input.as_bytes())?;
     let tokens = tokenizer.tokenize()?;
     pluck_versions_from_tokens(input, tokens)
+}
+
+pub(crate) fn pluck_packument_index_from_tokens(
+    input: &str,
+    tokens: Vec<Token>,
+) -> Result<PackumentIndex<'_>, Error> {
+    enum State<'i> {
+        Start,
+        WantNameValue,
+        InVersions,
+        WantVersion(&'i str),
+        InDistTags,
+        WantDistTagValue(&'i str),
+        InTime,
+        WantTimeValue(&'i str),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ObjectKind {
+        Unknown,
+        Version,
+        Dist,
+        NpmUser,
+        Attestations,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PendingObject {
+        Dist,
+        NpmUser,
+        Attestations,
+    }
+
+    let mut state = State::Start;
+    let mut name = None;
+    let mut versions = Vec::new();
+    let mut version_ranges = Vec::new();
+    let mut dist_tags = rustc_hash::FxHashMap::<&str, &str>::default();
+    let mut time = rustc_hash::FxHashMap::<&str, &str>::default();
+    let mut trust_evidence = rustc_hash::FxHashMap::<&str, TrustEvidence>::default();
+    let mut object_depth = 0usize;
+    let mut current_version = None;
+    let mut object_kinds = Vec::new();
+    let mut pending_object = None;
+    let input_bytes = input.as_bytes();
+
+    for token in tokens {
+        match token.kind() {
+            TokenKind::String => {
+                let v = token.value(input_bytes);
+                if object_depth == 1 {
+                    if matches!(state, State::WantNameValue) {
+                        name = Some(token.string_value(input));
+                        state = State::Start;
+                    } else if v == b"name" {
+                        state = State::WantNameValue;
+                    } else if v == b"versions" {
+                        state = State::InVersions;
+                    } else if v == b"dist-tags" {
+                        state = State::InDistTags;
+                    } else if v == b"time" {
+                        state = State::InTime;
+                    }
+                } else if object_depth == 2 && matches!(state, State::InVersions) {
+                    let version = token.string_value(input);
+                    versions.push(version);
+                    state = State::WantVersion(version);
+                } else if object_depth == 2 && matches!(state, State::InDistTags) {
+                    let key = token.string_value(input);
+                    dist_tags.insert(key, "");
+                    state = State::WantDistTagValue(key);
+                } else if object_depth == 2 && matches!(state, State::InTime) {
+                    let key = token.string_value(input);
+                    time.insert(key, "");
+                    state = State::WantTimeValue(key);
+                } else if object_depth == 2 {
+                    match state {
+                        State::WantDistTagValue(key) => {
+                            if let Some(dist_tag) = dist_tags.get_mut(key) {
+                                *dist_tag = token.string_value(input);
+                            }
+                            state = State::InDistTags;
+                        }
+                        State::WantTimeValue(key) => {
+                            if let Some(time_value) = time.get_mut(key) {
+                                *time_value = token.string_value(input);
+                            }
+                            state = State::InTime;
+                        }
+                        _ => {}
+                    }
+                } else if let Some(version) = current_version {
+                    match object_kinds.last().copied().unwrap_or(ObjectKind::Unknown) {
+                        ObjectKind::Version => {
+                            if v == b"dist" {
+                                pending_object = Some(PendingObject::Dist);
+                            } else if v == b"_npmUser" {
+                                pending_object = Some(PendingObject::NpmUser);
+                            } else {
+                                pending_object = None;
+                            }
+                        }
+                        ObjectKind::Dist => {
+                            if v == b"attestations" {
+                                pending_object = Some(PendingObject::Attestations);
+                            } else {
+                                pending_object = None;
+                            }
+                        }
+                        ObjectKind::NpmUser => {
+                            if v == b"approver" {
+                                insert_trust_evidence(
+                                    &mut trust_evidence,
+                                    version,
+                                    TrustEvidence::StagedPublish,
+                                );
+                            } else if v == b"trustedPublisher" {
+                                insert_trust_evidence(
+                                    &mut trust_evidence,
+                                    version,
+                                    TrustEvidence::TrustedPublisher,
+                                );
+                            }
+                        }
+                        ObjectKind::Attestations => {
+                            if v == b"provenance" {
+                                insert_trust_evidence(
+                                    &mut trust_evidence,
+                                    version,
+                                    TrustEvidence::Provenance,
+                                );
+                            }
+                        }
+                        ObjectKind::Unknown => {}
+                    }
+                }
+            }
+            TokenKind::Operator => {
+                let v = input_bytes[token.start() as usize];
+                if !matches!(v, b'{' | b'}' | b'[' | b']') {
+                    continue;
+                }
+                if v == b'{' {
+                    object_depth += 1;
+                    let kind = if object_depth == 3 {
+                        if let State::WantVersion(version) = state {
+                            version_ranges.push((token.start(), token.end()));
+                            current_version = Some(version);
+                            ObjectKind::Version
+                        } else {
+                            ObjectKind::Unknown
+                        }
+                    } else {
+                        match (object_kinds.last().copied(), pending_object.take()) {
+                            (Some(ObjectKind::Version), Some(PendingObject::Dist)) => {
+                                ObjectKind::Dist
+                            }
+                            (Some(ObjectKind::Version), Some(PendingObject::NpmUser)) => {
+                                ObjectKind::NpmUser
+                            }
+                            (Some(ObjectKind::Dist), Some(PendingObject::Attestations)) => {
+                                ObjectKind::Attestations
+                            }
+                            _ => ObjectKind::Unknown,
+                        }
+                    };
+                    object_kinds.push(kind);
+                } else if v == b'}' {
+                    if object_depth == 2
+                        && matches!(state, State::InVersions | State::InDistTags | State::InTime)
+                    {
+                        state = State::Start;
+                    } else if object_depth == 3 && matches!(state, State::WantVersion(_)) {
+                        if let Some(last) = version_ranges.last_mut() {
+                            last.1 = token.end();
+                        }
+                        state = State::InVersions;
+                        current_version = None;
+                        pending_object = None;
+                    }
+                    if object_depth == 0 {
+                        return Err(Error::UnmatchedBrace(token.start() as usize));
+                    }
+                    object_depth -= 1;
+                    object_kinds.pop();
+                } else if v == b'[' {
+                    object_depth += 1;
+                    object_kinds.push(ObjectKind::Unknown);
+                } else if v == b']' {
+                    if object_depth == 0 {
+                        return Err(Error::UnmatchedBrace(token.start() as usize));
+                    }
+                    object_depth -= 1;
+                    object_kinds.pop();
+                }
+            }
+        }
+    }
+
+    if object_depth != 0 {
+        return Err(Error::UnmatchedBrace(input.len()));
+    }
+
+    Ok(PackumentIndex {
+        name,
+        versions,
+        version_ranges,
+        dist_tags,
+        time,
+        trust_evidence,
+    })
+}
+
+fn insert_trust_evidence<'i>(
+    trust_evidence: &mut rustc_hash::FxHashMap<&'i str, TrustEvidence>,
+    version: &'i str,
+    evidence: TrustEvidence,
+) {
+    trust_evidence
+        .entry(version)
+        .and_modify(|current| {
+            if evidence > *current {
+                *current = evidence;
+            }
+        })
+        .or_insert(evidence);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TrustEvidence {
+    Provenance,
+    TrustedPublisher,
+    StagedPublish,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackumentIndex<'i> {
+    pub name: Option<&'i str>,
+    pub versions: Vec<&'i str>,
+    pub version_ranges: Vec<(u32, u32)>,
+    pub dist_tags: rustc_hash::FxHashMap<&'i str, &'i str>,
+    pub time: rustc_hash::FxHashMap<&'i str, &'i str>,
+    pub trust_evidence: rustc_hash::FxHashMap<&'i str, TrustEvidence>,
+}
+
+pub fn pluck_packument_index(input: &str) -> Result<PackumentIndex<'_>, Error> {
+    let tokenizer = Tokenizer::<NoCommaOrColon>::new(input.as_bytes())?;
+    let tokens = tokenizer.tokenize()?;
+    pluck_packument_index_from_tokens(input, tokens)
 }
 
 #[cfg(test)]
@@ -1015,8 +1350,7 @@ mod tests {
 
         fn then(self, offset: u32, f: impl FnOnce(Self, u32) -> Self) -> Self {
             let last_end = self.tokens.last().map_or(0, |t| t.end());
-            let s = f(self, last_end + offset);
-            s
+            f(self, last_end + offset)
         }
 
         fn with_string(mut self, start: u32, s: &str) -> Self {
@@ -1072,6 +1406,7 @@ mod tests {
 
     fn assert_tokens_eq(input: &str, expected: Vec<Token>) {
         let tokens = Tokenizer::<KeepAll>::new(input.as_bytes())
+            .unwrap()
             .tokenize()
             .unwrap();
         if tokens != expected {
@@ -1079,6 +1414,116 @@ mod tests {
             eprintln!("expected\n-----\n{}", annotated(input, &expected));
         }
         assert_eq!(tokens, expected);
+    }
+
+    fn assert_packument_projection_matches_serde(input: &str) {
+        let index = pluck_packument_index(input).unwrap();
+        let value: serde_json::Value = serde_json::from_str(input).unwrap();
+        let object = value.as_object().unwrap();
+
+        assert_eq!(index.name, object.get("name").and_then(|v| v.as_str()));
+
+        let versions = object["versions"].as_object().unwrap();
+        assert_eq!(index.versions.len(), versions.len());
+        assert_eq!(index.version_ranges.len(), versions.len());
+
+        for (version, range) in index.versions.iter().zip(&index.version_ranges) {
+            assert!(
+                versions.contains_key(*version),
+                "indexed unknown version {version}"
+            );
+            let range_json: serde_json::Value =
+                serde_json::from_str(&input[range.0 as usize..range.1 as usize]).unwrap();
+            assert_eq!(range_json, versions[*version]);
+        }
+
+        let expected_dist_tags = object
+            .get("dist-tags")
+            .and_then(|v| v.as_object())
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, value)| value.as_str().map(|value| (key.as_str(), value)))
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        assert_eq!(index.dist_tags, expected_dist_tags);
+
+        let expected_time = object
+            .get("time")
+            .and_then(|v| v.as_object())
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, value)| value.as_str().map(|value| (key.as_str(), value)))
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        assert_eq!(index.time, expected_time);
+    }
+
+    fn generated_packument(seed: u32) -> String {
+        let version_count = 1 + seed as usize % 8;
+        let mut input = String::new();
+        input.push_str("{\"_rev\":\"");
+        input.push_str(&seed.to_string());
+        input.push_str("\",\"name\":\"@scope/pkg-");
+        input.push_str(&seed.to_string());
+        input.push_str("\",\"noise\":{\"versions\":{\"9.9.9\":{}}},\"dist-tags\":{");
+        input.push_str("\"latest\":\"1.0.0\"");
+        if version_count > 1 {
+            input.push_str(",\"beta\":\"1.0.1\"");
+        }
+        input.push_str("},\"versions\":{");
+        for i in 0..version_count {
+            if i > 0 {
+                input.push(',');
+            }
+            let version = format!("1.0.{i}");
+            input.push('"');
+            input.push_str(&version);
+            input.push_str("\":{\"version\":\"");
+            input.push_str(&version);
+            input.push_str("\",\"description\":\"line \\\\n quote \\\" ok\",");
+            input.push_str("\"dependencies\":{\"dep\":\"^");
+            input.push_str(&i.to_string());
+            input.push_str(".0.0\"},");
+            if i % 3 == 0 {
+                input.push_str("\"dist\":{\"tarball\":\"https://registry.example/pkg.tgz\",\"attestations\":{\"provenance\":true}},");
+            }
+            if i % 3 == 1 {
+                input.push_str("\"_npmUser\":{\"trustedPublisher\":{\"id\":\"publisher\"}},");
+            }
+            if i % 3 == 2 {
+                input.push_str("\"_npmUser\":{\"approver\":{\"name\":\"approver\"}},");
+            }
+            input.push_str("\"nested\":{\"dist\":{\"attestations\":{\"provenance\":true}},\"_npmUser\":{\"approver\":true}}}");
+        }
+        input.push_str("},\"time\":{\"created\":\"2024-01-01T00:00:00.000Z\"");
+        for i in 0..version_count {
+            input.push_str(",\"1.0.");
+            input.push_str(&i.to_string());
+            input.push_str("\":\"2024-01-");
+            input.push_str(&format!("{:02}", i + 2));
+            input.push_str("T00:00:00.000Z\"");
+        }
+        input.push_str("}}");
+        input
+    }
+
+    #[test]
+    fn active_classifier_matches_scalar_classifier() {
+        let mut input = [0u8; 64];
+        let sample = br#" { "x": [1, 2, {"y": "\n"}] }	"#;
+        input[..sample.len()].copy_from_slice(sample);
+        input[sample.len()] = b'\r';
+        input[40] = 0x0c;
+        input[41] = 0x1a;
+        input[42] = 0xff;
+
+        let block = simd::Simd8x64::<u8>::load(&input);
+        let active = JsonCharacterBlock::classify(&block);
+        let comparison = classify::classify_by_comparison(&block);
+        let scalar = classify::classify_scalar(&block);
+
+        assert_eq!(active.whitespace(), comparison.whitespace());
+        assert_eq!(active.op(), comparison.op());
+        assert_eq!(active.whitespace(), scalar.whitespace());
+        assert_eq!(active.op(), scalar.op());
     }
 
     #[test]
@@ -1165,6 +1610,226 @@ mod tests {
     }
 
     #[test]
+    fn test_pluck_packument_index() {
+        let input = r#"{"name":"pkg","dist-tags":{"latest":"1.1.0"},"versions":{"1.0.0":{"version":"1.0.0","dist":{"attestations":{"provenance":{"x":1}}}},"1.1.0":{"version":"1.1.0","_npmUser":{"trustedPublisher":{"x":1},"approver":{"name":"a"}}}},"time":{"created":"2024-01-01T00:00:00.000Z","modified":"2024-01-03T00:00:00.000Z","1.0.0":"2024-01-02T00:00:00.000Z","1.1.0":"2024-01-03T00:00:00.000Z"}}"#;
+        let index = pluck_packument_index(input).unwrap();
+        assert_eq!(index.name, Some("pkg"));
+        assert_eq!(index.versions, vec!["1.0.0", "1.1.0"]);
+        assert_eq!(
+            index.dist_tags,
+            vec![("latest", "1.1.0")].into_iter().collect()
+        );
+        assert_eq!(
+            index.time,
+            vec![
+                ("created", "2024-01-01T00:00:00.000Z"),
+                ("modified", "2024-01-03T00:00:00.000Z"),
+                ("1.0.0", "2024-01-02T00:00:00.000Z"),
+                ("1.1.0", "2024-01-03T00:00:00.000Z"),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            index.trust_evidence,
+            vec![
+                ("1.0.0", TrustEvidence::Provenance),
+                ("1.1.0", TrustEvidence::StagedPublish),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let first_range = index.version_ranges[0];
+        assert_eq!(
+            &input[first_range.0 as usize..first_range.1 as usize],
+            r#"{"version":"1.0.0","dist":{"attestations":{"provenance":{"x":1}}}}"#
+        );
+    }
+
+    #[test]
+    fn packument_index_matches_serde_json_projection() {
+        let input = r#"{
+          "noise": {"versions": {"ignored": {}}},
+          "name": "pkg",
+          "dist-tags": {"latest": "2.0.0", "beta": "2.1.0-beta.0"},
+          "versions": {
+            "1.0.0": {
+              "version": "1.0.0",
+              "dist": {"attestations": {"provenance": true}},
+              "nested": {"_npmUser": {"approver": true}}
+            },
+            "2.0.0": {
+              "version": "2.0.0",
+              "_npmUser": {"trustedPublisher": {"id": "pub"}}
+            },
+            "2.1.0-beta.0": {
+              "version": "2.1.0-beta.0",
+              "_npmUser": {"approver": {"name": "approver"}}
+            }
+          },
+          "time": {
+            "created": "2024-01-01T00:00:00.000Z",
+            "1.0.0": "2024-01-02T00:00:00.000Z",
+            "2.0.0": "2024-01-03T00:00:00.000Z",
+            "2.1.0-beta.0": "2024-01-04T00:00:00.000Z"
+          }
+        }"#;
+
+        let index = pluck_packument_index(input).unwrap();
+        let value: serde_json::Value = serde_json::from_str(input).unwrap();
+        let object = value.as_object().unwrap();
+
+        assert_eq!(index.name, object.get("name").and_then(|v| v.as_str()));
+
+        let expected_versions = object["versions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(index.versions, expected_versions);
+
+        for version in &index.versions {
+            let range = index.version_ranges[index
+                .versions
+                .iter()
+                .position(|candidate| candidate == version)
+                .unwrap()];
+            let range_json: serde_json::Value =
+                serde_json::from_str(&input[range.0 as usize..range.1 as usize]).unwrap();
+            assert_eq!(range_json, object["versions"][*version]);
+        }
+
+        let expected_dist_tags = object["dist-tags"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str().unwrap()))
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        assert_eq!(index.dist_tags, expected_dist_tags);
+
+        let expected_time = object["time"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str().unwrap()))
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        assert_eq!(index.time, expected_time);
+
+        assert_eq!(
+            index.trust_evidence,
+            vec![
+                ("1.0.0", TrustEvidence::Provenance),
+                ("2.0.0", TrustEvidence::TrustedPublisher),
+                ("2.1.0-beta.0", TrustEvidence::StagedPublish),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn packument_index_handles_top_level_fields_in_any_order() {
+        let input = r#"{
+          "time": {
+            "1.0.0": "2024-01-02T00:00:00.000Z",
+            "created": "2024-01-01T00:00:00.000Z"
+          },
+          "metadata": {
+            "versions": {"ignored": {}},
+            "time": {"ignored": "2020-01-01T00:00:00.000Z"},
+            "dist-tags": {"ignored": "0.0.0"}
+          },
+          "versions": {
+            "1.0.0": {
+              "version": "1.0.0",
+              "files": [
+                {"_npmUser": {"approver": true}},
+                {"dist": {"attestations": {"provenance": true}}}
+              ],
+              "dist": {"attestations": {"provenance": true}}
+            }
+          },
+          "name": "pkg",
+          "dist-tags": {"latest": "1.0.0"}
+        }"#;
+
+        assert_packument_projection_matches_serde(input);
+        let index = pluck_packument_index(input).unwrap();
+        assert_eq!(
+            index.trust_evidence,
+            vec![("1.0.0", TrustEvidence::Provenance)]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn packument_index_ignores_trust_evidence_outside_direct_paths() {
+        let input = r#"{
+          "name": "pkg",
+          "versions": {
+            "1.0.0": {
+              "version": "1.0.0",
+              "nested": {
+                "dist": {"attestations": {"provenance": true}},
+                "_npmUser": {
+                  "trustedPublisher": {"id": "publisher"},
+                  "approver": {"name": "approver"}
+                }
+              }
+            },
+            "1.0.1": {
+              "version": "1.0.1",
+              "dist": {
+                "nested": {"attestations": {"provenance": true}}
+              },
+              "_npmUser": {
+                "nested": {
+                  "trustedPublisher": {"id": "publisher"},
+                  "approver": {"name": "approver"}
+                }
+              }
+            }
+          },
+          "dist-tags": {"latest": "1.0.1"},
+          "time": {
+            "1.0.0": "2024-01-02T00:00:00.000Z",
+            "1.0.1": "2024-01-03T00:00:00.000Z"
+          }
+        }"#;
+
+        assert_packument_projection_matches_serde(input);
+        let index = pluck_packument_index(input).unwrap();
+        assert!(index.trust_evidence.is_empty());
+    }
+
+    #[test]
+    fn generated_packuments_match_serde_json_projection() {
+        for seed in 0..64 {
+            let input = generated_packument(seed);
+            assert_packument_projection_matches_serde(&input);
+
+            let index = pluck_packument_index(&input).unwrap();
+            let expected_trust_evidence = index
+                .versions
+                .iter()
+                .enumerate()
+                .map(|(i, version)| {
+                    let evidence = match i % 3 {
+                        0 => TrustEvidence::Provenance,
+                        1 => TrustEvidence::TrustedPublisher,
+                        _ => TrustEvidence::StagedPublish,
+                    };
+                    (*version, evidence)
+                })
+                .collect::<rustc_hash::FxHashMap<_, _>>();
+            assert_eq!(index.trust_evidence, expected_trust_evidence);
+        }
+    }
+
+    #[test]
     fn escaped_quotes() {
         let input = r#"{"versions":{"aaa\"bbb":{}}}"#;
         let expected = TokensBuilder::new()
@@ -1206,5 +1871,60 @@ mod tests {
         let input = r#"{"versions:{}}"#;
         let error = pluck_versions(input).unwrap_err();
         assert_eq!(error, Error::UnclosedString);
+    }
+
+    #[test]
+    fn unclosed_object() {
+        let input = r#"{"versions":{"1.0.0":{}"#;
+        let error = pluck_versions(input).unwrap_err();
+        assert_eq!(error, Error::UnmatchedBrace(input.len()));
+
+        let error = pluck_packument_index(input).unwrap_err();
+        assert_eq!(error, Error::UnmatchedBrace(input.len()));
+    }
+
+    #[test]
+    fn malformed_inputs_do_not_panic() {
+        let inputs = [
+            "",
+            "{",
+            "}",
+            "[",
+            "]",
+            "{{{{",
+            "}}}}",
+            r#"{"versions":["1.0.0"]}"#,
+            r#"{"versions":{"1.0.0":null}}"#,
+            r#"{"versions":{"1.0.0":[]}}"#,
+            r#"{"versions":{"1.0.0":{"version":"1.0.0"}"#,
+            r#"{"dist-tags":{"latest":null},"versions":{}}"#,
+            r#"{"time":{"1.0.0":null},"versions":{}}"#,
+            r#"{"name":null,"versions":{}}"#,
+            r#"{"versions":{"\"":{}},"dist-tags":{"latest":"\""}}"#,
+        ];
+
+        for input in inputs {
+            let _ = pluck_versions(input);
+            let _ = pluck_packument_index(input);
+        }
+    }
+
+    #[test]
+    fn false_positive_operator_candidates_do_not_panic() {
+        let input = std::str::from_utf8(&[
+            123, 34, 118, 101, 114, 115, 105, 111, 110, 115, 34, 58, 123, 34, 49, 46, 48, 46, 48,
+            34, 58, 123, 34, 118, 101, 114, 115, 105, 111, 110, 34, 58, 34, 49, 46, 48, 34, 34, 34,
+            34, 34, 34, 35, 34, 34, 34, 34, 105, 115, 101, 34, 205, 132, 221, 137, 101, 114, 115,
+            105, 111, 110, 34, 34, 34, 34, 34, 34, 34, 34, 34, 42, 34, 34, 34, 34, 34, 34, 34, 34,
+            34, 92, 0, 0, 0, 34, 34, 34, 34, 34, 34, 92, 0, 0, 0, 34, 34, 34, 34, 34, 34, 34, 34,
+            34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 48, 34, 58, 34, 50, 48, 50,
+            52, 45, 48, 49, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 115, 34, 58,
+            123, 34, 57, 46, 39, 57, 46, 57, 34, 58, 123, 125, 125, 45, 34, 100, 105, 115, 116, 45,
+            116, 97, 46, 48, 34, 125,
+        ])
+        .unwrap();
+
+        let _ = pluck_versions(input);
+        let _ = pluck_packument_index(input);
     }
 }

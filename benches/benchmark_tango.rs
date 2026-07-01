@@ -22,7 +22,7 @@ fn bench_pluck_versions(input: &str) -> NpmPackageVersionInfo {
 }
 
 fn bench_parse_versions(input: &str, version: &Version) -> NpmPackageVersionInfo {
-    let info: NpmPackageInfo = serde_json::from_str(&input).unwrap();
+    let info: NpmPackageInfo = serde_json::from_str(input).unwrap();
     let version_info = info.versions.get(version).cloned().unwrap();
     assert_eq!(version_info.version.to_string(), version.to_string());
     version_info
@@ -32,7 +32,7 @@ const PRISMA_PATH: &str =
     "/Users/nathanwhit/Library/Caches/deno/npm/registry.npmjs.org/@prisma/client/registry.json";
 
 fn bench_pluck_versions_prisma(input: &str) -> NpmPackageVersionInfo {
-    let versions = fast_registry_json::pluck_versions(&input).unwrap();
+    let versions = fast_registry_json::pluck_versions(input).unwrap();
     let mut map = FxHashMap::with_capacity_and_hasher(versions.versions.len(), Default::default());
     for (version, range) in versions.versions.into_iter().zip(versions.version_ranges) {
         map.insert(version, range);
@@ -45,8 +45,8 @@ fn bench_pluck_versions_prisma(input: &str) -> NpmPackageVersionInfo {
 }
 
 fn bench_parse_versions_prisma(input: &str, version: &Version) -> NpmPackageVersionInfo {
-    let info: NpmPackageInfo = serde_json::from_str(&input).unwrap();
-    let version_info = info.versions.get(&version).cloned().unwrap();
+    let info: NpmPackageInfo = serde_json::from_str(input).unwrap();
+    let version_info = info.versions.get(version).cloned().unwrap();
     assert_eq!(version_info.version.to_string(), version.to_string());
     version_info
 }

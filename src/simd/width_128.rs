@@ -139,6 +139,8 @@ impl Simd8<bool> {
         pick! {
             if #[cfg(all(feature = "simd", target_arch = "x86_64"))] {
                 let inner: __m128i = bytemuck::must_cast(self.base);
+                // SAFETY: SSE2 is part of the x86_64 baseline, and `inner` is
+                // a valid 128-bit vector value.
                 unsafe { std::arch::x86_64::_mm_movemask_epi8(inner) as u32 }
             } else {
                 let bit_mask = u8x16::new([
@@ -321,7 +323,10 @@ impl Simd8<u8> {
         pick! {
             if #[cfg(all(feature = "simd", target_arch = "aarch64", target_feature = "neon"))] {
                 let inner: uint8x16_t = bytemuck::must_cast(self.base);
-                bytemuck::must_cast::<uint8x16_t, u8x16>(unsafe { std::arch::aarch64::vshrq_n_u8(inner, N) }).into()
+                // SAFETY: this branch only compiles when NEON is enabled, and
+                // `inner` is a valid 128-bit vector value.
+                let shifted = unsafe { std::arch::aarch64::vshrq_n_u8(inner, N) };
+                bytemuck::must_cast::<uint8x16_t, u8x16>(shifted).into()
             } else {
                 let inner = self.base.as_array_ref();
                 let mut arr = [0u8; 16];
@@ -337,7 +342,10 @@ impl Simd8<u8> {
         pick! {
             if #[cfg(all(feature = "simd", target_arch = "aarch64", target_feature = "neon"))] {
                 let inner: uint8x16_t = bytemuck::must_cast(self.base);
-                bytemuck::must_cast::<uint8x16_t, u8x16>(unsafe { std::arch::aarch64::vshlq_n_u8(inner, N) }).into()
+                // SAFETY: this branch only compiles when NEON is enabled, and
+                // `inner` is a valid 128-bit vector value.
+                let shifted = unsafe { std::arch::aarch64::vshlq_n_u8(inner, N) };
+                bytemuck::must_cast::<uint8x16_t, u8x16>(shifted).into()
             } else {
                 let inner = self.base.as_array_ref();
                 let mut arr = [0u8; 16];
@@ -354,7 +362,10 @@ impl Simd8<u8> {
             if #[cfg(all(feature = "simd", target_arch = "aarch64", target_feature = "neon"))] {
                 let inner: uint8x16_t = bytemuck::must_cast(self.base);
                 let inner2: uint8x16_t = bytemuck::must_cast(original.base);
-                bytemuck::must_cast::<uint8x16_t, u8x16>(unsafe { std::arch::aarch64::vqtbl1q_u8(inner, inner2) }).into()
+                // SAFETY: this branch only compiles when NEON is enabled, and
+                // both operands are valid 128-bit vector values.
+                let looked_up = unsafe { std::arch::aarch64::vqtbl1q_u8(inner, inner2) };
+                bytemuck::must_cast::<uint8x16_t, u8x16>(looked_up).into()
             } else {
                 let inner = self.base.as_array_ref();
                 let inner2 = original.base.as_array_ref();
@@ -408,7 +419,10 @@ impl Simd8<u8> {
                 let inner: uint8x16_t = bytemuck::must_cast(self.base);
                 let inner2: uint8x16_t = bytemuck::must_cast(bits.base);
 
-                bytemuck::must_cast::<uint8x16_t, u8x16>(unsafe { std::arch::aarch64::vtstq_u8(inner, inner2) }).into()
+                // SAFETY: this branch only compiles when NEON is enabled, and
+                // both operands are valid 128-bit vector values.
+                let tested = unsafe { std::arch::aarch64::vtstq_u8(inner, inner2) };
+                bytemuck::must_cast::<uint8x16_t, u8x16>(tested).into()
             } else {
                 let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = self.base.to_array();
                 let [a2, b2, c2, d2, e2, f2, g2, h2, i2, j2, k2, l2, m2, n2, o2, p2] =
@@ -438,16 +452,6 @@ impl Simd8<u8> {
 
 pub trait U8x16Ext {
     fn pairwise_add(self, other: u8x16) -> u8x16;
-
-    pick! {
-        if #[cfg(all(target_arch = "x86_64"))] {
-            fn to_underlying(self) -> __m128i;
-        } else if #[cfg(all(target_arch = "aarch64", target_feature = "neon"))] {
-            fn to_underlying(self) -> uint8x16_t;
-        } else {
-            fn to_underlying(self) -> u8x16;
-        }
-    }
 }
 
 impl U8x16Ext for u8x16 {
@@ -457,7 +461,10 @@ impl U8x16Ext for u8x16 {
             if #[cfg(all(feature = "simd", target_arch = "aarch64", target_feature = "neon"))] {
                 let inner: uint8x16_t = bytemuck::must_cast(self);
                 let inner2: uint8x16_t = bytemuck::must_cast(other);
-                bytemuck::must_cast::<uint8x16_t, u8x16>(unsafe { std::arch::aarch64::vpaddq_u8(inner, inner2) })
+                // SAFETY: this branch only compiles when NEON is enabled, and
+                // both operands are valid 128-bit vector values.
+                let summed = unsafe { std::arch::aarch64::vpaddq_u8(inner, inner2) };
+                bytemuck::must_cast::<uint8x16_t, u8x16>(summed)
             } else {
                 let arr = self.as_array_ref();
                 let arr2 = other.as_array_ref();
@@ -482,29 +489,10 @@ impl U8x16Ext for u8x16 {
             }
         }
     }
-
-    pick! {
-        if #[cfg(all(target_arch = "x86_64"))] {
-            #[inline(always)]
-            fn to_underlying(self) -> __m128i {
-                bytemuck::must_cast(self)
-            }
-        } else if #[cfg(all(target_arch = "aarch64", target_feature = "neon"))] {
-            #[inline(always)]
-            fn to_underlying(self) -> uint8x16_t {
-                bytemuck::must_cast(self)
-            }
-        } else {
-            #[inline(always)]
-            fn to_underlying(self) -> u8x16 {
-                self
-            }
-        }
-    }
 }
 
 pick! {
-    if #[cfg(all(target_arch = "x86_64"))] {
+    if #[cfg(all(feature = "simd", target_arch = "x86_64"))] {
         impl<T> From<__m128i> for Simd8<T> where Simd8<T>: From<u8x16>{
             #[inline(always)]
             fn from(value: __m128i) -> Self {

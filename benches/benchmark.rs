@@ -49,6 +49,35 @@ macro_rules! bench_parse_pluck {
                     })
                 });
             }
+
+            #[divan::bench]
+            fn [<bench_packument_index_ $name>](b: Bencher) {
+                let input = std::fs::read_to_string($path).unwrap();
+                b.bench(|| {
+                    black_box(fast_registry_json::pluck_packument_index(&input).unwrap())
+                });
+            }
+
+            #[divan::bench]
+            fn [<bench_packument_index_deser_ $name>](b: Bencher) {
+                let input = std::fs::read_to_string($path).unwrap();
+                b.bench(|| {
+                    black_box({
+                        let index = fast_registry_json::pluck_packument_index(&input).unwrap();
+                        let range = index
+                            .versions
+                            .iter()
+                            .zip(index.version_ranges)
+                            .find_map(|(version, range)| (*version == $version).then_some(range))
+                            .unwrap();
+                        let info: NpmPackageVersionInfo =
+                            serde_json::from_str(&input[range.0 as usize..range.1 as usize])
+                                .unwrap();
+                        assert_eq!(info.version.to_string(), $version);
+                        info
+                    })
+                });
+            }
         }
     };
 }
