@@ -56,10 +56,6 @@ impl<'a, const STEP_SIZE: usize> BufBlockReader<'a, STEP_SIZE> {
         }
     }
 
-    pub fn block_index(&self) -> usize {
-        self.idx
-    }
-
     pub fn has_full_block(&self) -> bool {
         self.idx < self.len_minus_step
     }
@@ -90,26 +86,9 @@ struct JsonEscapeScanner {
 }
 
 struct EscapedAndEscape {
-    /**
-     * Mask of escaped characters.
-     *
-     * ```notrust
-     * \n \\n \\\n \\\\n \
-     * 0100100010100101000
-     *  n  \   \ n  \ \
-     * ```
-     */
+    /// Mask of characters escaped by a preceding backslash. This excludes the
+    /// backslashes that perform the escaping.
     escaped: u64,
-    // /**
-    //  * Mask of escape characters.
-    //  *
-    //  * ```notrust
-    //  * \n \\n \\\n \\\\n \
-    //  * 1001000101001010001
-    //  * \  \   \ \  \ \   \
-    //  * ```
-    //  */
-    // escape: u64,
 }
 
 impl JsonEscapeScanner {
@@ -117,23 +96,10 @@ impl JsonEscapeScanner {
         Self::default()
     }
 
-    /**
-     * Get a mask of both escape and escaped characters (the characters following a backslash).
-     *
-     * @param potential_escape A mask of the character that can escape others (but could be
-     *        escaped itself). e.g. block.eq('\\')
-     */
     fn next(&mut self, backslash: u64) -> EscapedAndEscape {
-        // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
-        // |--------------------------------|----------------------------------------|-------|---------------------|
-        // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |       |                     |
-        // |                                | `    even   odd    even   odd   odd`   |       |                     |
-        // | potential_escape               | ` \  \\\    \\\    \\\\   \\\\  \\\`   | 1     | 1 (backslash & ~first_is_escaped)
-        // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 5     | 5 (next_escape_and_terminal_code())
-        // | escaped                        | `\    \ n    \ n    \ \    \ \   \ ` X | 6     | 7 (escape_and_terminal_code ^ (potential_escape | first_is_escaped))
-        // | escape                         | `    \ \    \ \    \ \    \ \   \ \`   | 6     | 8 (escape_and_terminal_code & backslash)
-        // | first_is_escaped               | `\                                 `   | 7 (*) | 9 (escape >> 63) ()
-        //                                                                               (*) this is not needed until the next iteration
+        // Work from runs of `\` characters. Even-length runs end unescaped;
+        // odd-length runs escape the following byte. A trailing odd run carries
+        // into the next block through `next_is_escaped`.
         let escape_and_terminal_code =
             Self::next_escape_and_terminal_code(backslash & !self.next_is_escaped);
         let escaped = escape_and_terminal_code ^ (backslash | self.next_is_escaped);
@@ -142,69 +108,19 @@ impl JsonEscapeScanner {
         EscapedAndEscape { escaped }
     }
 
-    /**
-     * Returns a mask of the next escape characters (masking out escaped backslashes), along with
-     * any non-backslash escape codes.
-     *
-     * \n \\n \\\n \\\\n returns:
-     * \n \   \ \n \ \
-     * 11 100 1011 10100
-     *
-     * You are expected to mask out the first bit yourself if the previous block had a trailing
-     * escape.
-     *
-     * & the result with potential_escape to get just the escape characters.
-     * ^ the result with (potential_escape | first_is_escaped) to get escaped characters.
-     */
     fn next_escape_and_terminal_code(potential_escape: u64) -> u64 {
-        // If we were to just shift and mask out any odd bits, we'd actually get a *half* right answer:
-        // any even-aligned backslash runs would be correct! Odd-aligned backslash runs would be
-        // inverted (\\\ would be 010 instead of 101).
-        //
-        // ```
-        // string:              | ____\\\\_\\\\_____ |
-        // maybe_escaped | ODD  |     \ \   \ \      |
-        //               even-aligned ^^^  ^^^^ odd-aligned
-        // ```
-        //
-        // Taking that into account, our basic strategy is:
-        //
-        // 1. Use subtraction to produce a mask with 1's for even-aligned runs and 0's for
-        //    odd-aligned runs.
-        // 2. XOR all odd bits, which masks out the odd bits in even-aligned runs, and brings IN the
-        //    odd bits in odd-aligned runs.
-        // 3. & with backslash to clean up any stray bits.
-        // runs are set to 0, and then XORing with "odd":
-        //
-        // |                                | Mask (shows characters instead of 1's) | Instructions        |
-        // |--------------------------------|----------------------------------------|---------------------|
-        // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |
-        // |                                | `    even   odd    even   odd   odd`   |
-        // | maybe_escaped                  | `  n  \\n    \\n    \\\_   \\\_  \\` X | 1 (potential_escape << 1)
-        // | maybe_escaped_and_odd          | ` \n_ \\n _ \\\n_ _ \\\__ _\\\_ \\\`   | 1 (maybe_escaped | odd)
-        // | even_series_codes_and_odd      | `  n_\\\  _    n_ _\\\\ _     _    `   | 1 (maybe_escaped_and_odd - potential_escape)
-        // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 1 (^ odd)
-        //
-
-        // Escaped characters are characters following an escape.
+        // Shift the candidate backslashes to the following byte, then use
+        // subtraction plus an odd-bit mask to distinguish odd and even aligned
+        // runs. The final xor leaves each escaping backslash and the byte it
+        // escapes set in the returned mask.
         let maybe_escaped = potential_escape << 1;
 
         const ODD_BITS: u64 = 0xAAAAAAAAAAAAAAAA;
 
-        // To distinguish odd from even escape sequences, therefore, we turn on any *starting*
-        // escapes that are on an odd byte. (We actually bring in all odd bits, for speed.)
-        // - Odd runs of backslashes are 0000, and the code at the end ("n" in \n or \\n) is 1.
-        // - Odd runs of backslashes are 1111, and the code at the end ("n" in \n or \\n) is 0.
-        // - All other odd bytes are 1, and even bytes are 0.
         let maybe_escaped_and_odd_bits = maybe_escaped | ODD_BITS;
         let even_series_codes_and_odd_bits =
             maybe_escaped_and_odd_bits.wrapping_sub(potential_escape);
 
-        // Now we flip all odd bytes back with xor. This:
-        // - Makes odd runs of backslashes go from 0000 to 1010
-        // - Makes even runs of backslashes go from 1111 to 1010
-        // - Sets actually-escaped codes to 1 (the n in \n and \\n: \n = 11, \\n = 100)
-        // - Resets all other bytes to 0
         even_series_codes_and_odd_bits ^ ODD_BITS
     }
 }
@@ -556,96 +472,12 @@ impl JsonCharacterBlock {
     }
 }
 
-#[derive(Debug)]
-/// A block of JSON parsing results combining string and character info
-pub(crate) struct JsonBlock {
-    /// String and escape characters
-    pub string: JsonStringBlock,
-    /// Whitespace, structural characters ('operators'), scalars
-    pub characters: JsonCharacterBlock,
-    // /// Whether the previous character was a scalar
-    // follows_potential_nonquote_scalar: u64,
-}
-
-impl JsonBlock {
-    /// Create a new JsonBlock
-    pub fn new(
-        string: JsonStringBlock,
-        characters: JsonCharacterBlock,
-        // follows_potential_nonquote_scalar: u64,
-    ) -> Self {
-        Self {
-            string,
-            characters,
-            // follows_potential_nonquote_scalar,
-        }
-    }
-
-    // /// The start of structurals.
-    // /// In simdjson prior to v0.3, these were called the pseudo-structural characters.
-    // pub fn structural_start(&self) -> u64 {
-    //     self.potential_structural_start() & !self.string.string_tail()
-    // }
-
-    // /// All JSON whitespace (i.e. not in a string)
-    // pub fn whitespace(&self) -> u64 {
-    //     self.non_quote_outside_string(self.characters.whitespace())
-    // }
-
-    // /// Whether the given characters are inside a string (only works on non-quotes)
-    // pub fn non_quote_inside_string(&self, mask: u64) -> u64 {
-    //     self.string.non_quote_inside_string(mask)
-    // }
-
-    // /// Whether the given characters are outside a string (only works on non-quotes)
-    // pub fn non_quote_outside_string(&self, mask: u64) -> u64 {
-    //     self.string.non_quote_outside_string(mask)
-    // }
-
-    // ------------ Private methods from C++ implementation ------------
-
-    // /// Structural elements ([,],{,},:, comma) plus scalar starts like 123, true and "abc".
-    // /// They may reside inside a string.
-    // fn potential_structural_start(&self) -> u64 {
-    //     self.characters.op() | self.potential_scalar_start()
-    // }
-
-    // /// The start of non-operator runs, like 123, true and "abc".
-    // /// It may reside inside a string.
-    // fn potential_scalar_start(&self) -> u64 {
-    //     // The term "scalar" refers to anything except structural characters and white space
-    //     // (so letters, numbers, quotes).
-    //     // Whenever it is preceded by something that is not a structural element ({,},[,],:, ") nor a white-space
-    //     // then we know that it is irrelevant structurally.
-    //     self.characters.scalar() & !self.follows_potential_scalar()
-    // }
-
-    // /// Whether the given character is immediately after a non-operator like 123, true.
-    // /// The characters following a quote are not included.
-    // fn follows_potential_scalar(&self) -> u64 {
-    //     // follows_potential_nonquote_scalar: is defined as marking any character that follows a character
-    //     // that is not a structural element ({,},[,],:, comma) nor a quote (") and that is not a
-    //     // white space.
-    //     // It is understood that within quoted region, anything at all could be marked (irrelevant).
-    //     self.follows_potential_nonquote_scalar
-    // }
-}
-
-/// Scans JSON for important bits: structural characters or 'operators', strings, and scalars.
+/// Scans JSON for string ranges and structural character candidates.
 ///
-/// The scanner starts by calculating two distinct things:
-/// - string characters (taking \" into account)
-/// - structural characters or 'operators' ([]{},:, comma)
-///   and scalars (runs of non-operators like 123, true and "abc")
-///
-/// To minimize data dependency (a key component of the scanner's speed), it finds these in parallel:
-/// in particular, the operator/scalar bit will find plenty of things that are actually part of
-/// strings. When we're done, JsonBlock will fuse the two together by masking out tokens that are
-/// part of a string.
+/// String and character classification are intentionally computed separately:
+/// the structural mask may include bytes inside strings, and callers combine it
+/// with the string mask when deciding which bytes are real tokens.
 pub(crate) struct JsonScanner {
-    // /// Whether the last character of the previous iteration is part of a scalar token
-    // /// (anything except whitespace or a structural character/'operator').
-    // prev_scalar: u64,
     string_scanner: JsonStringScanner,
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     character_classifier: CharacterClassifier,
@@ -654,7 +486,6 @@ pub(crate) struct JsonScanner {
 impl JsonScanner {
     pub fn new() -> Self {
         Self {
-            // prev_scalar: 0,
             string_scanner: JsonStringScanner::new(),
             #[cfg(all(feature = "simd", target_arch = "x86_64"))]
             character_classifier: classify::runtime_classifier(),
@@ -662,26 +493,14 @@ impl JsonScanner {
     }
 
     #[inline(always)]
-    pub fn next(&mut self, input: &simd::Simd8x64<u8>) -> JsonBlock {
+    pub fn next(&mut self, input: &simd::Simd8x64<u8>) -> (JsonStringBlock, JsonCharacterBlock) {
         let strings = self.string_scanner.next(input);
-        // Identifies the white-space and the structural characters
         #[cfg(all(feature = "simd", target_arch = "x86_64"))]
         let characters = (self.character_classifier)(input);
         #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
         let characters = JsonCharacterBlock::classify(input);
 
-        // The term "scalar" refers to anything except structural characters and white space
-        // (so letters, numbers, quotes).
-        // We want follows_scalar to mark anything that follows a non-quote scalar (so letters and numbers).
-        //
-        // A terminal quote should either be followed by a structural character (comma, brace, bracket, colon)
-        // or nothing. However, we still want ' "a string"true ' to mark the 't' of 'true' as a potential
-        // pseudo-structural character just like we would if we had  ' "a string" true '; otherwise we
-        // may need to add an extra check when parsing strings.
-        // let nonquote_scalar = characters.scalar() & !strings.quote();
-        // let follows_nonquote_scalar = follows(nonquote_scalar, &mut self.prev_scalar);
-
-        JsonBlock::new(strings, characters)
+        (strings, characters)
     }
 
     #[inline(always)]
@@ -690,22 +509,7 @@ impl JsonScanner {
     }
 }
 
-// /// Check if the current character immediately follows a matching character.
-// ///
-// /// For example, this checks for quotes with backslashes in front of them:
-// ///
-// /// ```ignore
-// /// let backslashed_quote = in.eq('"') & follows(in.eq('\\'), &mut prev_backslash);
-// /// ```
-// #[inline(always)]
-// fn follows(match_mask: u64, overflow: &mut u64) -> u64 {
-//     let result = (match_mask << 1) | *overflow;
-//     *overflow = match_mask >> 63;
-//     result
-// }
-
 pub(crate) struct BitIndexer {
-    idx: usize,
     last_was_quote: bool,
 }
 
@@ -718,7 +522,6 @@ impl BitIndexer {
     #[inline(always)]
     pub fn new() -> Self {
         Self {
-            idx: 0,
             last_was_quote: false,
         }
     }
@@ -800,9 +603,9 @@ impl BitIndexer {
     }
 
     #[inline(always)]
-    pub fn write(&mut self, index: u32, bits: u64, quotes: u64, tail: &mut Vec<Token>) -> usize {
+    pub fn write(&mut self, index: u32, bits: u64, quotes: u64, tail: &mut Vec<Token>) {
         if bits == 0 {
-            return 0;
+            return;
         }
 
         let cnt = bits.count_ones();
@@ -815,9 +618,6 @@ impl BitIndexer {
                 self.write_index(index, &mut rev_bits, quotes, tail);
             }
         }
-
-        self.idx += cnt as usize;
-        cnt as usize
     }
 }
 
@@ -873,7 +673,6 @@ impl Token {
 pub(crate) enum TokenKind {
     Operator = 0,
     String = 1,
-    // Scalar,
 }
 pub(crate) struct Tokenizer<'a, Mask: OpMask = NoCommaOrColon> {
     scanner: JsonScanner,
@@ -917,7 +716,6 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
         Ok(Self {
             scanner: JsonScanner::new(),
             tokens: Vec::with_capacity(input.len() / 4),
-            // buf: [TypedIndex::ZERO; 64],
             block_reader: BufBlockReader::new(input),
             idx: 0,
             _marker: std::marker::PhantomData,
@@ -926,36 +724,45 @@ impl<'a, Mask: OpMask> Tokenizer<'a, Mask> {
     }
 
     #[inline(always)]
-    fn process_json_block(&mut self, json_block: JsonBlock, dont_care: u64) {
-        let ops = json_block.characters.op() & !json_block.string.in_string & !dont_care;
-        let strings = json_block.string.quote;
-        let _wrote = self
-            .bit_indexer
-            .write(self.idx, ops | strings, strings, &mut self.tokens);
+    fn process_json_block(
+        &mut self,
+        strings: JsonStringBlock,
+        characters: JsonCharacterBlock,
+        dont_care: u64,
+    ) {
+        let ops = characters.op() & !strings.in_string & !dont_care;
+        let quotes = strings.quote;
+        self.bit_indexer
+            .write(self.idx, ops | quotes, quotes, &mut self.tokens);
     }
 
     pub fn tokenize(mut self) -> Result<Vec<Token>, Error> {
         while self.block_reader.has_full_block() {
             let block = self.block_reader.full_block();
             let block = simd::Simd8x64::<u8>::load(arrayref::array_ref![block, 0, 64]);
-            let json_block = self.scanner.next(&block);
+            let (strings, characters) = self.scanner.next(&block);
             self.block_reader.advance();
             let dont_care = Mask::op_mask(&block);
-            self.process_json_block(json_block, dont_care);
+            self.process_json_block(strings, characters, dont_care);
             self.idx += 64;
         }
 
         let mut remainder_buf = [0; 64];
         let _pad = self.block_reader.get_remainder(&mut remainder_buf);
         let block = simd::Simd8x64::<u8>::load(arrayref::array_ref![&remainder_buf, 0, 64]);
-        let json_block = self.scanner.next(&block);
+        let (strings, characters) = self.scanner.next(&block);
         self.block_reader.advance();
         let dont_care = Mask::op_mask(&block);
-        self.process_json_block(json_block, dont_care);
+        self.process_json_block(strings, characters, dont_care);
         self.idx += 64;
         self.scanner.finish()?;
         Ok(self.tokens)
     }
+}
+
+fn structural_operator(input: &[u8], token: Token) -> Option<u8> {
+    let byte = input[token.start() as usize];
+    matches!(byte, b'{' | b'}' | b'[' | b']').then_some(byte)
 }
 
 pub(crate) fn pluck_versions_from_tokens(
@@ -1006,10 +813,9 @@ pub(crate) fn pluck_versions_from_tokens(
                 }
             }
             TokenKind::Operator => {
-                let v = input_bytes[token.start() as usize];
-                if !matches!(v, b'{' | b'}' | b'[' | b']') {
+                let Some(v) = structural_operator(input_bytes, token) else {
                     continue;
-                }
+                };
                 if v == b'{' {
                     object_depth += 1;
                     if object_depth == 3 && matches!(state, State::WantVersion) {
@@ -1202,10 +1008,9 @@ pub(crate) fn pluck_packument_index_from_tokens(
                 }
             }
             TokenKind::Operator => {
-                let v = input_bytes[token.start() as usize];
-                if !matches!(v, b'{' | b'}' | b'[' | b']') {
+                let Some(v) = structural_operator(input_bytes, token) else {
                     continue;
-                }
+                };
                 if v == b'{' {
                     object_depth += 1;
                     let kind = if object_depth == 3 {

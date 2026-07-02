@@ -14,63 +14,13 @@ use wide::u8x16;
 
 use arrayref::{array_refs, mut_array_refs};
 
-trait WrapsBaseU8 {
-    fn base(self) -> u8x16;
-    fn from_base(base: u8x16) -> Self;
-}
-
-macro_rules! impl_wrapper {
-    ($t: ty) => {
-        impl BitOr for $t {
-            type Output = Self;
-            #[inline(always)]
-            fn bitor(self, rhs: Self) -> Self::Output {
-                Self::from_base(self.base().bitor(rhs.base()))
-            }
-        }
-        impl BitAnd for $t {
-            type Output = Self;
-            #[inline(always)]
-            fn bitand(self, rhs: Self) -> Self::Output {
-                Self::from_base(self.base().bitand(rhs.base()))
-            }
-        }
-
-        impl BitXor for $t {
-            type Output = Self;
-            #[inline(always)]
-            fn bitxor(self, rhs: Self) -> Self::Output {
-                Self::from_base(self.base().bitxor(rhs.base()))
-            }
-        }
-        impl Not for $t {
-            type Output = Self;
-            #[inline(always)]
-            fn not(self) -> Self::Output {
-                Self::from_base(self.base().not())
-            }
-        }
-        impl From<u8x16> for $t {
-            #[inline(always)]
-            fn from(value: u8x16) -> Self {
-                Self::from_base(value.into())
-            }
-        }
-    };
-}
-
 #[derive(Copy, Clone)]
 pub struct Simd8<T> {
     pub base: u8x16,
     _marker: PhantomData<T>,
 }
 
-impl WrapsBaseU8 for Simd8<u8> {
-    #[inline(always)]
-    fn base(self) -> u8x16 {
-        self.base
-    }
-
+impl<T> Simd8<T> {
     #[inline(always)]
     fn from_base(base: u8x16) -> Self {
         Self {
@@ -78,18 +28,59 @@ impl WrapsBaseU8 for Simd8<u8> {
             _marker: PhantomData,
         }
     }
+
+    #[inline(always)]
+    pub fn eq_mask(&self, rhs: &Simd8<T>) -> Simd8<bool> {
+        self.base.cmp_eq(rhs.base).into()
+    }
 }
 
-impl_wrapper!(Simd8<u8>);
+impl<T> BitOr for Simd8<T> {
+    type Output = Self;
+
+    #[inline(always)]
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self::from_base(self.base | rhs.base)
+    }
+}
+
+impl<T> BitAnd for Simd8<T> {
+    type Output = Self;
+
+    #[inline(always)]
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self::from_base(self.base & rhs.base)
+    }
+}
+
+impl<T> BitXor for Simd8<T> {
+    type Output = Self;
+
+    #[inline(always)]
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Self::from_base(self.base ^ rhs.base)
+    }
+}
+
+impl<T> Not for Simd8<T> {
+    type Output = Self;
+
+    #[inline(always)]
+    fn not(self) -> Self::Output {
+        Self::from_base(!self.base)
+    }
+}
+
+impl<T> From<u8x16> for Simd8<T> {
+    #[inline(always)]
+    fn from(value: u8x16) -> Self {
+        Self::from_base(value)
+    }
+}
 
 impl Simd8<u8> {
     #[inline(always)]
-    /// Loads a uint8x16_t from a pointer.
-    ///
-    /// # Safety
-    ///
-    /// The pointer must be valid and aligned,
-    /// and must point to an array of at least 16 u8s
+    /// Loads 16 bytes into a vector.
     pub fn load(values: [u8; 16]) -> u8x16 {
         u8x16::new(values)
     }
@@ -129,11 +120,6 @@ impl From<[u8; 16]> for Simd8<u8> {
 }
 
 impl Simd8<bool> {
-    #[inline(always)]
-    pub fn splat(value: bool) -> u8x16 {
-        u8x16::splat(if value { 0xFF } else { 0x00 })
-    }
-
     #[inline(always)]
     pub fn to_bitmask(&self) -> u32 {
         pick! {
@@ -179,7 +165,6 @@ pub fn make_u8x16(
     let array = [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p];
     u8x16::new(array)
 }
-// const SIZE: usize = ;
 const NUM_CHUNKS: usize = 64 / size_of::<Simd8<u8>>();
 
 pub struct Simd8x64<T> {
@@ -212,60 +197,10 @@ impl Simd8x64<u8> {
     }
 }
 
-pub trait Splat<T> {
-    fn splat(value: T) -> Simd8<T>;
-}
-
-impl Splat<u8> for Simd8<u8> {
+impl Simd8x64<u8> {
     #[inline(always)]
-    fn splat(value: u8) -> Simd8<u8> {
-        Simd8::<u8>::splat(value)
-    }
-}
-
-impl Splat<bool> for Simd8<bool> {
-    #[inline(always)]
-    fn splat(value: bool) -> Simd8<bool> {
-        Simd8::<bool>::splat(value).into()
-    }
-}
-
-impl WrapsBaseU8 for Simd8<bool> {
-    #[inline(always)]
-    fn base(self) -> u8x16 {
-        self.base
-    }
-
-    #[inline(always)]
-    fn from_base(base: u8x16) -> Self {
-        Self {
-            base,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl From<u8x16> for Simd8<bool> {
-    #[inline(always)]
-    fn from(value: u8x16) -> Self {
-        Self::from_base(value)
-    }
-}
-
-impl<T> Simd8<T> {
-    #[inline(always)]
-    pub fn eq_mask(&self, rhs: &Simd8<T>) -> Simd8<bool> {
-        self.base.cmp_eq(rhs.base).into()
-    }
-}
-
-impl<T> Simd8x64<T>
-where
-    Simd8<T>: Splat<T>,
-{
-    #[inline(always)]
-    pub fn eq(&self, value: T) -> u64 {
-        let mask = Simd8::<T>::splat(value);
+    pub fn eq(&self, value: u8) -> u64 {
+        let mask = Simd8::<u8>::splat(value);
 
         let a = mask.eq_mask(&self.chunks[0]);
         let b = mask.eq_mask(&self.chunks[1]);
@@ -277,7 +212,9 @@ where
         }
         .to_bitmask()
     }
+}
 
+impl<T> Simd8x64<T> {
     #[inline(always)]
     pub fn cmp_eq_mask(&self, other: &Simd8x64<T>) -> u64 {
         let a = self.chunks[0].eq_mask(&other.chunks[0]);
@@ -493,7 +430,7 @@ impl U8x16Ext for u8x16 {
 
 pick! {
     if #[cfg(all(feature = "simd", target_arch = "x86_64"))] {
-        impl<T> From<__m128i> for Simd8<T> where Simd8<T>: From<u8x16>{
+        impl<T> From<__m128i> for Simd8<T> {
             #[inline(always)]
             fn from(value: __m128i) -> Self {
                 bytemuck::must_cast::<__m128i, u8x16>(value).into()
